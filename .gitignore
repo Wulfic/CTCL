@@ -170,8 +170,6 @@ dist/
 # Minecraft / Fabric (Loom)
 ############################
 run/
-# ForgeGradle's generated Eclipse run configs (forge/run*.launch)
-*.launch
 *.iml
 *.ipr
 *.iws

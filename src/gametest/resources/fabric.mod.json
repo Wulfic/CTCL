@@ -1,0 +1,22 @@
+{
+	"schemaVersion": 1,
+	"id": "ctcl-gametest",
+	"version": "1.0.0",
+	"name": "CTCL game tests",
+	"license": "MIT",
+	"environment": "*",
+	"entrypoints": {
+		"fabric-gametest": [
+			"net.wulfnet.ctcl.gametest.LoaderGameTests",
+			"net.wulfnet.ctcl.gametest.NetworkingGameTests",
+			"net.wulfnet.ctcl.gametest.DimensionGameTests"
+		],
+		"fabric-client-gametest": [
+			"net.wulfnet.ctcl.gametest.CtclClientGameTest"
+		]
+	},
+	"depends": {
+		"ctcl": "*",
+		"fabric-gametest-api-v1": "*"
+	}
+}

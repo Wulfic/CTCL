@@ -1,0 +1,14 @@
+{
+	"required": true,
+	"package": "net.wulfnet.ctcl.mixin",
+	"compatibilityLevel": "JAVA_21",
+	"mixins": [
+		"CraftingMenuAccessor",
+		"CraftingTableBlockMixin",
+		"DimensionDataStorageAccessor",
+		"ServerPlayerMixin"
+	],
+	"injectors": {
+		"defaultRequire": 1
+	}
+}

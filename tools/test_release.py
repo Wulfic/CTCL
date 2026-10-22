@@ -23,24 +23,13 @@ def tearDownModule():
 PINS_26 = {
     "minecraft_version": "26.1",
     "mod_version": "1.0.0",
-    "archives_base_name": "ctcl",
     "fabric_api.26.1": "0.145.1+26.1",
     "fabric_api.26.1.1": "0.145.4+26.1.1",
     "fabric_api.26.1.2": "0.155.3+26.1.2",
     "fabric_api.26.2": "0.161.0+26.2",
     "fabric_api.26.3": "0.161.0+26.3",
 }
-# band/26.1 today: every loader, as in gradle.properties.
-PINS_26_ALL = {
-    **PINS_26,
-    **{f"quilt_loader.{mc}": "0.30.1" for mc in ("26.1", "26.1.1", "26.1.2", "26.2", "26.3")},
-    "neoforge.26.1.2": "26.1.2.112",
-    "neoforge.26.2": "26.2.0.88",
-    "forge.26.1.2": "64.1.0",
-    "forge.26.2": "65.1.0",
-}
-PROPS_1_21_11 = {"minecraft_version": "1.21.11", "fabric_api_version": "0.141.6+1.21.11", "mod_version": "1.0.0",
-                 "archives_base_name": "ctcl"}
+PROPS_1_21_11 = {"minecraft_version": "1.21.11", "fabric_api_version": "0.141.6+1.21.11", "mod_version": "1.0.0"}
 SHA_A = "a" * 40
 SHA_B = "b" * 40
 
@@ -50,10 +39,9 @@ DESTRUCTIVE = (("gh", "release", "delete"), ("gh", "release", "create"), ("git",
 class FakeRunner:
     """Answers read-only commands from canned output and records every call."""
 
-    def __init__(self, tags=None, releases=(), assets=None):
+    def __init__(self, tags=None, releases=()):
         self.tags = tags or {}
         self.releases = list(releases)
-        self.assets = assets or {}
         self.calls = []
 
     def __call__(self, args):
@@ -63,8 +51,6 @@ class FakeRunner:
             return "".join(f"{sha}\trefs/tags/{name}\n" for name, sha in self.tags.items())
         if args[:3] == ["gh", "release", "list"]:
             return json.dumps([{"tagName": t} for t in self.releases])
-        if args[:3] == ["gh", "release", "view"]:
-            return json.dumps({"assets": [{"name": n} for n in self.assets.get(args[3], [])]})
         return ""
 
     def destructive_calls(self):
@@ -127,11 +113,11 @@ class BandLayoutTest(unittest.TestCase):
         self.assertEqual((band.base, band.others, band.label, band.multi), ("1.21.11", (), "1.21.11", False))
 
     def test_one_release_line_has_no_range(self):
-        props = {"mod_version": "1.0.0", "archives_base_name": "ctcl", "fabric_api.26.1": "x", "fabric_api.26.1.2": "y"}
+        props = {"mod_version": "1.0.0", "fabric_api.26.1": "x", "fabric_api.26.1.2": "y"}
         self.assertEqual(release.band_layout("band/26.1", props).label, "26.1")
 
     def test_versions_sort_numerically(self):
-        props = {"mod_version": "1.0.0", "archives_base_name": "ctcl", "fabric_api.26.9": "x", "fabric_api.26.10": "y"}
+        props = {"mod_version": "1.0.0", "fabric_api.26.9": "x", "fabric_api.26.10": "y"}
         self.assertEqual(release.band_layout("band/26.9", props).label, "26.9-26.10")
 
     def test_refuses_a_branch_that_is_not_the_bands_base(self):
@@ -190,200 +176,49 @@ class PlanTest(unittest.TestCase):
         self.assertEqual(plan.version, "1.0.1")
 
 
-class ReleaseJarsTest(unittest.TestCase):
-    """The expected jars mirror gradle/release.gradle, fabric/build.gradle, and gradle/pins.gradle."""
-
-    def names(self, props, version="1.1.0", branch="band/26.1"):
-        band = release.band_layout(branch, props)
-        return [jar.name(band.archives, version) for jar in band.jars]
-
-    def test_todays_band_ships_two_jars(self):
-        self.assertEqual(self.names(PINS_26_ALL), [
-            "ctcl-1.1.0+26.1-26.3-Fabric-Quilt.jar",
-            "ctcl-1.1.0+26.1.2-26.2-Forge-NeoForge.jar",
-        ])
-
-    def test_loaders_on_the_same_range_share_one_jar(self):
-        props = dict(PINS_26_ALL)
-        for mc in ("26.1", "26.1.1", "26.3"):
-            props[f"neoforge.{mc}"] = "x"
-            props[f"forge.{mc}"] = "y"
-        self.assertEqual(self.names(props), ["ctcl-1.1.0+26.1-26.3-Fabric-Quilt-Forge-NeoForge.jar"])
-
-    def test_quilt_joins_only_when_pinned(self):
-        props = {k: v for k, v in PINS_26_ALL.items() if not k.startswith("quilt_loader.")}
-        self.assertEqual(self.names(props)[0], "ctcl-1.1.0+26.1-26.3-Fabric.jar")
-
-    def test_loader_label_on_one_line_is_its_pins(self):
-        props = {k: v for k, v in PINS_26_ALL.items() if not k.startswith(("forge.", "neoforge."))}
-        self.assertEqual(self.names({**props, "neoforge.26.2": "x"})[1], "ctcl-1.1.0+26.2-NeoForge.jar")
-        self.assertEqual(self.names({**props, "neoforge.26.1.1": "x", "neoforge.26.1.2": "y"})[1],
-                         "ctcl-1.1.0+26.1.1-26.1.2-NeoForge.jar")
-
-    def test_single_project_band_keeps_its_v1_name(self):
-        self.assertEqual(self.names(PROPS_1_21_11, "1.0.0", "band/1.21.11"), ["ctcl-1.0.0+1.21.11.jar"])
-
-    def test_matrix_covers_every_loader_on_every_pin_but_the_base(self):
-        band = release.band_layout("band/26.1", PINS_26_ALL)
-        self.assertEqual([(m["loader"], m["minecraft"]) for m in band.matrix], [
-            ("fabric", "26.1.1"), ("fabric", "26.1.2"), ("fabric", "26.2"), ("fabric", "26.3"),
-            ("neoforge", "26.1.2"), ("neoforge", "26.2"), ("forge", "26.1.2"), ("forge", "26.2"),
-        ])
-        self.assertTrue(all(m["quilt"] for m in band.matrix if m["loader"] == "fabric"))
-        self.assertTrue(band.quilt)
-        self.assertEqual(release.band_layout("band/1.21.11", PROPS_1_21_11).matrix, ())
-
-    def test_plan_outputs_carry_the_jars_and_matrix(self):
-        band = release.band_layout("band/26.1", PINS_26_ALL)
-        plan = release.make_plan(band, ["v1.0.0+26.1-26.3"], lambda tag: [("feat: forge", "")])
-        outputs = release.plan_outputs(plan)
-        self.assertEqual(json.loads(outputs["jars"]), self.names(PINS_26_ALL))
-        self.assertEqual(len(json.loads(outputs["matrix"])), 8)
-        self.assertEqual((outputs["label"], outputs["version"], outputs["quilt"], outputs["multi"]),
-                         ("26.1-26.3", "1.1.0", "true", "true"))
-
-    def test_refuses_partial_or_stray_quilt(self):
-        partial = {k: v for k, v in PINS_26_ALL.items() if k != "quilt_loader.26.3"}
-        stray = {**PINS_26_ALL, "quilt_loader.26.4": "0.30.1"}
-        for name, props in (("partial", partial), ("stray", stray)):
-            with self.subTest(name), self.assertRaises(release.ReleaseError):
-                release.band_layout("band/26.1", props)
-
-    def test_refuses_a_gap_between_release_lines(self):
-        props = {**{k: v for k, v in PINS_26_ALL.items() if k != "neoforge.26.2"}, "neoforge.26.3": "x"}
-        with self.assertRaisesRegex(release.ReleaseError, "gap"):
-            release.band_layout("band/26.1", props)
-
-    def test_refuses_a_loader_outside_the_band(self):
-        for key in ("forge.26.4", "neoforge.26.0"):
-            with self.subTest(key), self.assertRaisesRegex(release.ReleaseError, "outside"):
-                release.band_layout("band/26.1", {**PINS_26_ALL, key: "x"})
-
-
 class PublishGuardTest(unittest.TestCase):
-    TAG = "v1.1.0+26.1-26.3"
-    FABRIC = "ctcl-1.1.0+26.1-26.3-Fabric-Quilt.jar"
-    FORGE = "ctcl-1.1.0+26.1.2-26.2-Forge-NeoForge.jar"
-
     def setUp(self):
-        tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(tmp.cleanup)
-        self.root = Path(tmp.name)
-        self.props = self.root / "gradle.properties"
-        self.write_props(PINS_26_ALL)
-        self.dir = self.root / "release-jars"
-        self.dir.mkdir()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
 
-    def write_props(self, props):
-        self.props.write_text("".join(f"{k}={v}\n" for k, v in props.items()), encoding="utf-8")
+    def jar(self, version):
+        path = Path(self.tmp.name) / "ctcl.jar"
+        with zipfile.ZipFile(path, "w") as z:
+            z.writestr("fabric.mod.json", json.dumps({"id": "ctcl", "version": version}))
+        return str(path)
 
-    def jar(self, name, fabric=None, forge=None, neoforge=None):
-        with zipfile.ZipFile(self.dir / name, "w") as z:
-            if fabric:
-                z.writestr("fabric.mod.json", json.dumps({"id": "ctcl", "version": fabric}))
-            for path, version in (("META-INF/mods.toml", forge), ("META-INF/neoforge.mods.toml", neoforge)):
-                if version:
-                    z.writestr(path, f'modLoader = "javafml"\n[[mods]]\nmodId = "ctcl"\nversion = "{version}"\n'
-                                     '[[dependencies.ctcl]]\nmodId = "minecraft"\nversionRange = "[26.1.2,26.3)"\n')
+    def publish(self, runner, version="1.0.1", label="26.1-26.3", jar_version="1.0.1+26.1-26.3", sha=SHA_A):
+        return release.main(["publish", "--version", version, "--label", label, "--jar", self.jar(jar_version), "--sha", sha], runner)
 
-    def good_jars(self):
-        self.jar(self.FABRIC, fabric="1.1.0+26.1-26.3")
-        self.jar(self.FORGE, forge="1.1.0+26.1.2-26.2", neoforge="1.1.0+26.1.2-26.2")
-        self.jar("ctcl-1.1.0+26.1-26.3-Fabric-Quilt-gametest.jar", fabric="1.1.0+26.1-26.3")   # staged too; never shipped
-
-    def publish(self, runner, version="1.1.0", sha=SHA_A, branch="band/26.1", notes_file=None):
-        args = ["publish", "--branch", branch, "--properties", str(self.props), "--version", version,
-                "--jars-dir", str(self.dir), "--sha", sha]
-        return release.main(args + (["--notes-file", str(notes_file)] if notes_file else []), runner)
-
-    def assert_refused(self, runner, **kwargs):
-        self.assertEqual(self.publish(runner, **kwargs), 1)
-        self.assertEqual(runner.destructive_calls(), [])
-
-    def test_creates_one_release_with_every_jar(self):
-        self.good_jars()
+    def test_creates_release_when_everything_matches(self):
         runner = FakeRunner()
         self.assertEqual(self.publish(runner), 0)
         created = runner.destructive_calls()
         self.assertEqual(len(created), 1)
-        call = created[0]
-        self.assertEqual(call[:4], ["gh", "release", "create", self.TAG])
-        self.assertEqual([Path(a).name for a in call if a.endswith(".jar")], [self.FABRIC, self.FORGE])
-        self.assertIn(SHA_A, call)
-        self.assertEqual(call[call.index("--title") + 1], "CTCL 1.1.0 for Minecraft 26.1-26.3")
-        notes = call[call.index("--notes") + 1]
-        self.assertIn(f"| `{self.FABRIC}` | Quilt | 26.1, 26.1.1, 26.1.2, 26.2, 26.3 |", notes)
-        self.assertIn(f"| `{self.FORGE}` | NeoForge | 26.1.2, 26.2 |", notes)
-
-    def test_notes_file_follows_the_jar_table(self):
-        self.good_jars()
-        notes_file = self.root / "notes.md"
-        notes_file.write_text("Changes since v1.0.0+26.1-26.3:\n- feat: forge\n", encoding="utf-8")
-        runner = FakeRunner()
-        self.assertEqual(self.publish(runner, notes_file=notes_file), 0)
-        call = runner.destructive_calls()[0]
-        notes = call[call.index("--notes") + 1]
-        self.assertLess(notes.index(self.FORGE), notes.index("- feat: forge"))
-
-    def test_single_project_band_publishes_its_one_jar(self):
-        self.write_props(PROPS_1_21_11)
-        self.jar("ctcl-1.0.0+1.21.11.jar", fabric="1.0.0+1.21.11")
-        runner = FakeRunner()
-        self.assertEqual(self.publish(runner, version="1.0.0", branch="band/1.21.11"), 0)
-        self.assertEqual(runner.destructive_calls()[0][:4], ["gh", "release", "create", "v1.0.0+1.21.11"])
-
-    def test_refuses_a_missing_jar(self):
-        self.jar(self.FABRIC, fabric="1.1.0+26.1-26.3")
-        self.assert_refused(FakeRunner())
-
-    def test_refuses_an_extra_jar(self):
-        self.good_jars()
-        self.jar("ctcl-1.0.0+26.1-26.3-Fabric-Quilt.jar", fabric="1.0.0+26.1-26.3")   # last release's, left behind
-        self.assert_refused(FakeRunner())
+        self.assertEqual(created[0][:4], ["gh", "release", "create", "v1.0.1+26.1-26.3"])
+        self.assertIn(SHA_A, created[0])
 
     def test_refuses_a_jar_that_declares_another_version(self):
-        self.good_jars()
-        self.jar(self.FORGE, forge="1.1.0+26.1.2-26.2", neoforge="1.1.0+26.1.2")
-        self.assert_refused(FakeRunner())
-
-    def test_refuses_a_name_that_lists_a_loader_the_jar_lacks(self):
-        self.good_jars()
-        self.jar(self.FORGE, forge="1.1.0+26.1.2-26.2")
-        self.assert_refused(FakeRunner())
-
-    def test_refuses_metadata_the_name_does_not_list(self):
-        self.good_jars()
-        self.jar(self.FABRIC, fabric="1.1.0+26.1-26.3", forge="1.1.0+26.1-26.3")
-        self.assert_refused(FakeRunner())
-
-    def test_refuses_unreadable_metadata(self):
-        self.good_jars()
-        with zipfile.ZipFile(self.dir / self.FORGE, "w") as z:
-            z.writestr("META-INF/mods.toml", "[[mods]\nmodId = ")
-            z.writestr("META-INF/neoforge.mods.toml", 'modLoader = "javafml"')
-        self.assert_refused(FakeRunner())
-        (self.dir / self.FORGE).write_bytes(b"not a zip")
-        self.assert_refused(FakeRunner())
+        runner = FakeRunner()
+        self.assertEqual(self.publish(runner, jar_version="1.0.1+26.1"), 1)
+        self.assertEqual(runner.destructive_calls(), [])
 
     def test_refuses_to_move_an_existing_tag(self):
-        self.good_jars()
-        self.assert_refused(FakeRunner(tags={self.TAG: SHA_B}, releases=[self.TAG]))
+        runner = FakeRunner(tags={"v1.0.1+26.1-26.3": SHA_B}, releases=["v1.0.1+26.1-26.3"])
+        self.assertEqual(self.publish(runner), 1)
+        self.assertEqual(runner.destructive_calls(), [])
 
     def test_rerun_of_a_finished_release_is_a_no_op(self):
-        self.good_jars()
-        runner = FakeRunner(tags={self.TAG: SHA_A}, releases=[self.TAG], assets={self.TAG: [self.FORGE, self.FABRIC]})
+        runner = FakeRunner(tags={"v1.0.1+26.1-26.3": SHA_A}, releases=["v1.0.1+26.1-26.3"])
         self.assertEqual(self.publish(runner), 0)
         self.assertEqual(runner.destructive_calls(), [])
 
-    def test_rerun_refuses_a_release_with_other_assets(self):
-        self.good_jars()
-        self.assert_refused(FakeRunner(tags={self.TAG: SHA_A}, releases=[self.TAG], assets={self.TAG: [self.FABRIC]}))
-
     def test_refuses_a_short_sha_or_bad_version(self):
-        self.good_jars()
         for kwargs in ({"sha": "abc123"}, {"version": "1.0"}, {"version": ""}):
+            runner = FakeRunner()
             with self.subTest(**kwargs):
-                self.assert_refused(FakeRunner(), **kwargs)
+                self.assertEqual(self.publish(runner, **kwargs), 1)
+                self.assertEqual(runner.destructive_calls(), [])
 
 
 class CleanupGuardTest(unittest.TestCase):
@@ -444,13 +279,6 @@ class CleanupGuardTest(unittest.TestCase):
         runner = self.runner()
         self.assertEqual(self.cleanup(runner, keep="v1.0.1+26.1-26.3"), 1)
         self.assertEqual(runner.destructive_calls(), [])
-
-    def test_a_jar_label_is_not_a_band(self):
-        # 26.1.2-26.2 is the Forge-NeoForge jar's label. A tag carrying it belongs to no band-26.1 release.
-        tags = {**self.TAGS, "v1.0.0+26.1.2-26.2": SHA_A}
-        runner = self.runner(tags=tags, releases=self.RELEASES + ["v1.0.0+26.1.2-26.2"])
-        self.assertEqual(self.cleanup(runner), 0)
-        self.assertNotIn("v1.0.0+26.1.2-26.2", [arg for call in runner.destructive_calls() for arg in call])
 
     def test_nothing_to_delete_is_fine(self):
         runner = FakeRunner(tags={"v1.0.0+26.1-26.3": SHA_A}, releases=["v1.0.0+26.1-26.3"])

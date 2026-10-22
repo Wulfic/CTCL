@@ -1,0 +1,12 @@
+{
+	"required": true,
+	"package": "net.wulfnet.ctcl.client.mixin",
+	"compatibilityLevel": "JAVA_21",
+	"client": [
+		"AbstractContainerScreenAccessor",
+		"AbstractRecipeBookScreenAccessor"
+	],
+	"injectors": {
+		"defaultRequire": 1
+	}
+}
