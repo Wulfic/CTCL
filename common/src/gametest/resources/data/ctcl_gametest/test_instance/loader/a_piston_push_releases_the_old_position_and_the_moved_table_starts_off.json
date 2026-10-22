@@ -1,0 +1,7 @@
+{
+	"type": "minecraft:function",
+	"function": "ctcl_gametest:loader/a_piston_push_releases_the_old_position_and_the_moved_table_starts_off",
+	"environment": "minecraft:default",
+	"structure": "minecraft:empty",
+	"max_ticks": 200
+}

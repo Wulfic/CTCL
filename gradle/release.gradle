@@ -1,0 +1,130 @@
+// Release-jar helpers shared by the root's releaseJars, fabric/, and gradle/harness.gradle (TODO 14.8): one jar per
+// Minecraft range, named for every loader it carries (decisions.md 2026-09-29, "one merged jar per range").
+
+import java.nio.file.Files
+import java.nio.file.StandardCopyOption
+import java.util.jar.Attributes
+import java.util.jar.Manifest
+import java.util.zip.ZipEntry
+import java.util.zip.ZipFile
+import java.util.zip.ZipOutputStream
+
+// The order loaders take in a jar name: the owner's example, ctcl-1.0.0+26.1-26.3-Fabric-Quilt-Forge-NeoForge.jar.
+def loaderOrder = ["Fabric", "Quilt", "Forge", "NeoForge"]
+
+// The entries only a loader's own build writes: its metadata and its entrypoint package. Every other entry is common/'s
+// and must be byte-identical wherever it appears. Quilt loads the Fabric jar and owns nothing of its own.
+def loaderOwned = [
+	Fabric: ["fabric.mod.json", "net/wulfnet/ctcl/fabric/"],
+	Quilt: [],
+	Forge: ["META-INF/mods.toml", "net/wulfnet/ctcl/forge/"],
+	NeoForge: ["META-INF/neoforge.mods.toml", "net/wulfnet/ctcl/neoforge/"],
+]
+
+// The loaders a jar's name lists: the tokens after the version, e.g. ctcl-1.0.0+26.1.2-26.2-Forge-NeoForge.jar ->
+// [Forge, NeoForge], ctcl-1.0.0+26.2-Forge-gametest.jar -> [Forge, gametest]. Version tokens start with a digit.
+def jarLoaders = { String name ->
+	def tokens = name.replaceAll(/\.jar$/, "").split("-").toList()
+	def lastVersion = tokens.findLastIndexOf { it ==~ /\d.*/ || it.contains("+") }
+	tokens.drop(lastVersion + 1)
+}
+
+// True when the entry name is one of the paths or under one of the package prefixes.
+def ownedBy = { String entry, Collection<String> owned ->
+	owned.any { it.endsWith("/") ? entry.startsWith(it) : entry == it }
+}
+
+def readEntries = { File jar ->
+	new ZipFile(jar).withCloseable { zip ->
+		Collections.list(zip.entries()).collect { entry -> [entry: entry, bytes: entry.directory ? null : zip.getInputStream(entry).bytes] }
+	}
+}
+
+// Every non-directory entry whose bytes differ between the two jars, or that only one of them has, except the ignored
+// ones (exact names, or package prefixes ending in /). Sorted, so the failure message is stable.
+def releaseJarDiff = { File release, File built, Collection<String> ignored ->
+	def files = { File jar ->
+		readEntries(jar).findAll { !it.entry.directory && !ownedBy(it.entry.name, ignored) }.collectEntries { [(it.entry.name): it.bytes] }
+	}
+	def shipped = files(release)
+	def compiled = files(built)
+	(shipped.keySet() + compiled.keySet()).findAll { !Arrays.equals(shipped[it] as byte[], compiled[it] as byte[]) }.sort()
+}
+
+// Writes one release jar from the loader jars of one range, given in loaderOrder. One jar is copied as it is, so its bytes
+// don't change. Several are merged: every shared path must have the same bytes, and the manifests' main attributes
+// must agree, or it fails. It writes to a temp file and moves it into place, so a failed merge never touches out.
+def mergeReleaseJars = { List<File> jars, File out ->
+	if (jars.isEmpty()) {
+		throw new GradleException("No loader jars to write ${out.name} from")
+	}
+	out.parentFile.mkdirs()
+	def temp = new File(out.parentFile, "${out.name}.tmp")
+	Files.deleteIfExists(temp.toPath())
+	try {
+		if (jars.size() == 1) {
+			Files.copy(jars.first().toPath(), temp.toPath())
+		} else {
+			def manifest = new Manifest()
+			manifest.mainAttributes.put(Attributes.Name.MANIFEST_VERSION, "1.0")
+			def written = [:]  // name -> [bytes, the jar it came from]
+			def order = []
+			jars.each { jar ->
+				readEntries(jar).each { item ->
+					String name = item.entry.name
+					if (name == "META-INF/MANIFEST.MF") {
+						def theirs = new Manifest(new ByteArrayInputStream(item.bytes))
+						if (!theirs.entries.isEmpty()) {
+							throw new GradleException("${jar.name}'s manifest has per-entry sections ${theirs.entries.keySet()}; the merge only knows main attributes")
+						}
+						theirs.mainAttributes.each { key, value ->
+							def ours = manifest.mainAttributes.get(key)
+							if (ours != null && ours != value) {
+								throw new GradleException("Can't merge ${jars*.name} into ${out.name}: manifest attribute ${key} is '${ours}' in one and '${value}' in ${jar.name}")
+							}
+							manifest.mainAttributes.put(key, value)
+						}
+					} else if (written.containsKey(name)) {
+						if (!Arrays.equals(written[name][0] as byte[], item.bytes as byte[])) {
+							throw new GradleException("Can't merge ${jars*.name} into ${out.name}: ${name} differs between ${written[name][1]} and ${jar.name}")
+						}
+					} else {
+						written[name] = [item.bytes, jar.name]
+						order << item.entry
+					}
+				}
+			}
+			// The manifest first, as java.util.jar expects; then every entry in the order the loader jars had them.
+			def manifestBytes = new ByteArrayOutputStream()
+			manifest.write(manifestBytes)
+			def time = order.first().time
+			temp.withOutputStream { stream ->
+				new ZipOutputStream(stream).withCloseable { zip ->
+					def put = { String name, byte[] bytes ->
+						def entry = new ZipEntry(name)
+						entry.time = time
+						zip.putNextEntry(entry)
+						if (bytes != null) {
+							zip.write(bytes)
+						}
+						zip.closeEntry()
+					}
+					put("META-INF/", null)
+					put("META-INF/MANIFEST.MF", manifestBytes.toByteArray())
+					order.findAll { it.name != "META-INF/" }.each { put(it.name, written[it.name][0] as byte[]) }
+				}
+			}
+		}
+		Files.move(temp.toPath(), out.toPath(), StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING)
+	} finally {
+		Files.deleteIfExists(temp.toPath())
+	}
+	out
+}
+
+ext.loaderOrder = loaderOrder
+ext.loaderOwned = loaderOwned
+ext.jarLoaders = jarLoaders
+ext.ownedBy = ownedBy
+ext.releaseJarDiff = releaseJarDiff
+ext.mergeReleaseJars = mergeReleaseJars

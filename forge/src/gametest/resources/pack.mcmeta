@@ -1,0 +1,7 @@
+{
+	"pack": {
+		"description": "CTCL game tests",
+		"min_format": 84,
+		"max_format": 121
+	}
+}

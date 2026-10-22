@@ -1,0 +1,32 @@
+// World helpers shared by the loader projects' production harnesses (apply from: rootProject.file('gradle/worlds.gradle')).
+
+import java.nio.file.Files
+import java.nio.file.Path
+
+// Copies a saved world into a new directory for a cross-loader run (TODO 13.6). The source is only read. The target must
+// not exist yet, so a copy never lands on top of anything; callers give it a fresh, timestamped name.
+def copyWorld = { File source, File target ->
+	if (!new File(source, "level.dat").isFile()) {
+		throw new GradleException("${source} is not a saved world: it has no level.dat")
+	}
+	if (target.exists()) {
+		throw new GradleException("Refusing to copy a world onto ${target}: it already exists")
+	}
+	Path from = source.toPath()
+	Path to = target.toPath()
+	Files.walk(from).withCloseable { paths ->
+		paths.forEach { Path path ->
+			// The lock belongs to whichever server last had the world open; the new server takes its own.
+			if (path.fileName.toString() != "session.lock") {
+				Files.copy(path, to.resolve(from.relativize(path).toString()))
+			}
+		}
+	}
+	logger.lifecycle("Copied the world ${source} to ${target}")
+}
+
+// A directory name no earlier run can have used.
+def importStamp = { -> "import-" + new Date().format("yyyyMMdd-HHmmss") }
+
+ext.copyWorld = copyWorld
+ext.importStamp = importStamp

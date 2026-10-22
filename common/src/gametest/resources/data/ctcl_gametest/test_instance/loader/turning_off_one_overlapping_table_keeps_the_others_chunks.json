@@ -1,0 +1,7 @@
+{
+	"type": "minecraft:function",
+	"function": "ctcl_gametest:loader/turning_off_one_overlapping_table_keeps_the_others_chunks",
+	"environment": "minecraft:default",
+	"structure": "minecraft:empty",
+	"max_ticks": 200
+}

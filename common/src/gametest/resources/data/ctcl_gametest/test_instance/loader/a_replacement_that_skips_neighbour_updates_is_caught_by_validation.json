@@ -1,0 +1,7 @@
+{
+	"type": "minecraft:function",
+	"function": "ctcl_gametest:loader/a_replacement_that_skips_neighbour_updates_is_caught_by_validation",
+	"environment": "minecraft:default",
+	"structure": "minecraft:empty",
+	"max_ticks": 200
+}

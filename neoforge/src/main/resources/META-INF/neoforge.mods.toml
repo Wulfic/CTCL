@@ -1,0 +1,31 @@
+modLoader = "javafml"
+loaderVersion = "[4,)"
+license = "MIT"
+
+[[mods]]
+modId = "ctcl"
+version = "${version}"
+displayName = "Crafting Table Chunk Loader"
+authors = "wulfic"
+description = '''Turns every vanilla crafting table into a chunk loader. A button on the crafting screen cycles the loaded square: 0, 1, 3, 5, 7, 9 chunks wide.'''
+
+[[mixins]]
+config = "ctcl.mixins.json"
+
+[[mixins]]
+config = "ctcl.client.mixins.json"
+
+# Both ranges come from the neoforge.<mc> pins (gradle/pins.gradle): each pinned build and newer, up to the next pinned version.
+[[dependencies.ctcl]]
+modId = "neoforge"
+type = "required"
+versionRange = "${neoforge_range}"
+ordering = "NONE"
+side = "BOTH"
+
+[[dependencies.ctcl]]
+modId = "minecraft"
+type = "required"
+versionRange = "${minecraft_range}"
+ordering = "NONE"
+side = "BOTH"

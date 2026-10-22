@@ -1,0 +1,7 @@
+{
+	"type": "minecraft:function",
+	"function": "ctcl_gametest:networking/a_table_broken_while_its_menu_is_open_changes_nothing",
+	"environment": "minecraft:default",
+	"structure": "minecraft:empty",
+	"max_ticks": 100
+}

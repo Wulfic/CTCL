@@ -1,0 +1,31 @@
+pluginManagement {
+	repositories {
+		maven {
+			name = 'Fabric'
+			url = 'https://maven.fabricmc.net/'
+		}
+		mavenCentral()
+		gradlePluginPortal()
+	}
+}
+
+plugins {
+	// Lets Gradle provision the Java 25 toolchain on machines that don't have one.
+	id 'org.gradle.toolchains.foojay-resolver-convention' version '1.0.0'
+}
+
+rootProject.name = 'ctcl'
+include 'common', 'fabric'
+
+// NeoForge and Forge build only for the Minecraft versions with a <loader>.<mc> pin. Today that's every version, a
+// beta build where there's no stable one (owner answer 27, TODO.md Stage 16). An explicit -Pminecraft_version a loader
+// has no pin for leaves it out of the build; with no -P, each builds its release jar on its own base, its lowest pin
+// (gradle/pins.gradle).
+def requestedMinecraft = startParameter.projectProperties.minecraft_version
+[neoforge: 'NeoForge', forge: 'Forge'].each { prefix, loader ->
+	if (requestedMinecraft == null || providers.gradleProperty("${prefix}.${requestedMinecraft}").isPresent()) {
+		include prefix
+	} else {
+		logger.lifecycle("${loader} skips Minecraft ${requestedMinecraft}: no ${prefix}.${requestedMinecraft} pin in gradle.properties")
+	}
+}

@@ -1,0 +1,7 @@
+{
+	"type": "minecraft:function",
+	"function": "ctcl_gametest:loader/breaking_the_table_releases_it_immediately",
+	"environment": "minecraft:default",
+	"structure": "minecraft:empty",
+	"max_ticks": 200
+}

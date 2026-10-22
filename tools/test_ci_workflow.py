@@ -88,12 +88,33 @@ class WorkflowTest(unittest.TestCase):
             self.assertIn(value.strip('"'), ("$PROD_MODS", "${PROD_MODS}"))
         self.assertRegex(text, r"\n\s+PROD_MODS: \$\{\{ github\.workspace \}\}/release-jars\n")
 
+    def test_plan_job_checks_the_live_pins_first(self):
+        # Every later job needs plan, so a pin check here gates the build and the release (owner answer 27).
+        lines = workflow_lines()
+        start = lines.index("  plan:")
+        end = next(i for i in range(start + 1, len(lines)) if re.match(r"^  \S", lines[i]))
+        job = lines[start:end]
+        checks = [i for i, line in enumerate(job) if "tools/check_pins.py" in line]
+        self.assertEqual(len(checks), 1, "the plan job must run tools/check_pins.py once")
+        self.assertRegex(job[checks[0]], r"run: python3 tools/check_pins\.py$", "CI checks the live APIs, not recordings")
+        self.assertLess(checks[0], job.index("      - id: plan"))
+
     def test_setup_gradle_writes_the_cache(self):
         text = WORKFLOW.read_text(encoding="utf-8")
         uses = re.findall(r"uses: gradle/actions/setup-gradle@", text)
         writing = re.findall(r"uses: gradle/actions/setup-gradle@\S+\n\s+with:\n\s+cache-read-only: false\n", text)
         self.assertTrue(uses)
         self.assertEqual(len(writing), len(uses), "every setup-gradle must set cache-read-only: false (owner answer 18)")
+
+    def test_failure_logs_carry_the_thread_dumps(self):
+        # The harness writes <console>-threads.txt before it kills a hung or dead process. No log glob matches that name, so
+        # without its own path the dump never leaves the runner (gotchas.md 2026-10-01).
+        text = WORKFLOW.read_text(encoding="utf-8")
+        uploads = re.findall(r"uses: actions/upload-artifact@\S+\n(?:.*\n)*?\s+path: \|\n((?:\s{12}\S.*\n)+)", text)
+        logs = [paths for paths in uploads if "hs_err_pid" in paths]
+        self.assertGreaterEqual(len(logs), 2, "expected the build and verify failure-log uploads")
+        for paths in logs:
+            self.assertIn("*/build/run/**/*-threads.txt", paths.split())
 
 
 class GradleTasksTest(unittest.TestCase):

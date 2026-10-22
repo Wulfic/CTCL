@@ -30,7 +30,7 @@ PINS_26 = {
     "fabric_api.26.2": "0.161.0+26.2",
     "fabric_api.26.3": "0.161.0+26.3",
 }
-# band/26.1 today: every loader, as in gradle.properties.
+# band/26.1 at v1.1.0: every loader, NeoForge and Forge on their stable pins only, so two jars.
 PINS_26_ALL = {
     **PINS_26,
     **{f"quilt_loader.{mc}": "0.30.1" for mc in ("26.1", "26.1.1", "26.1.2", "26.2", "26.3")},
@@ -39,6 +39,18 @@ PINS_26_ALL = {
     "forge.26.1.2": "64.1.0",
     "forge.26.2": "65.1.0",
 }
+# band/26.1 since Stage 16: NeoForge and Forge on every pin, a beta build where there's no stable one (owner answer 27).
+PINS_26_BETAS = {
+    **PINS_26_ALL,
+    "neoforge.26.1": "26.1.0.19-beta",
+    "neoforge.26.1.1": "26.1.1.15-beta",
+    "neoforge.26.3": "26.3.0.39-beta",
+    "forge.26.1": "62.0.9",
+    "forge.26.1.1": "63.0.2",
+    "forge.26.3": "66.0.9",
+    "forge_beta_versions": "26.1,26.1.1,26.3",
+}
+GRADLE_PROPERTIES = Path(__file__).resolve().parent.parent / "gradle.properties"
 PROPS_1_21_11 = {"minecraft_version": "1.21.11", "fabric_api_version": "0.141.6+1.21.11", "mod_version": "1.0.0",
                  "archives_base_name": "ctcl"}
 SHA_A = "a" * 40
@@ -258,6 +270,57 @@ class ReleaseJarsTest(unittest.TestCase):
         for key in ("forge.26.4", "neoforge.26.0"):
             with self.subTest(key), self.assertRaisesRegex(release.ReleaseError, "outside"):
                 release.band_layout("band/26.1", {**PINS_26_ALL, key: "x"})
+
+
+class BetaMarksTest(unittest.TestCase):
+    """Owner answer 36: the notes mark each version a loader runs on a beta build, then name the builds."""
+
+    @staticmethod
+    def betas(props):
+        return {r.loader: r.betas for jar in release.band_layout("band/26.1", props).jars for r in jar.loaders}
+
+    def notes(self, props, branch="band/26.1"):
+        return release.release_notes(release.band_layout(branch, props), "1.2.0", None, SHA_A)
+
+    def test_suffixed_neoforge_and_marked_forge_pins_are_betas(self):
+        self.assertEqual(self.betas(PINS_26_BETAS), {
+            "Fabric": (),
+            "Quilt": (),
+            "NeoForge": (("26.1", "26.1.0.19-beta"), ("26.1.1", "26.1.1.15-beta"), ("26.3", "26.3.0.39-beta")),
+            "Forge": (("26.1", "62.0.9"), ("26.1.1", "63.0.2"), ("26.3", "66.0.9")),
+        })
+
+    def test_a_forge_pin_outside_the_beta_list_is_stable(self):
+        # Forge builds carry no suffix, so only forge_beta_versions marks one (owner answer 30).
+        props = {**PINS_26_BETAS, "forge_beta_versions": "26.1"}
+        self.assertEqual(self.betas(props)["Forge"], (("26.1", "62.0.9"),))
+        self.assertEqual(self.betas({**PINS_26_BETAS, "forge_beta_versions": ""})["Forge"], ())
+
+    def test_notes_mark_beta_versions_and_name_the_builds(self):
+        notes = self.notes(PINS_26_BETAS)
+        jar = "ctcl-1.2.0+26.1-26.3-Fabric-Quilt-Forge-NeoForge.jar"
+        self.assertIn(f"| `{jar}` | Fabric | 26.1, 26.1.1, 26.1.2, 26.2, 26.3 |", notes)
+        self.assertIn(f"| `{jar}` | NeoForge | 26.1 (beta), 26.1.1 (beta), 26.1.2, 26.2, 26.3 (beta) |", notes)
+        self.assertIn(f"| `{jar}` | Forge | 26.1 (beta), 26.1.1 (beta), 26.1.2, 26.2, 26.3 (beta) |", notes)
+        builds = next(line for line in notes.splitlines() if line.startswith("(beta)"))
+        self.assertIn("NeoForge 26.1.0.19-beta on 26.1, 26.1.1.15-beta on 26.1.1, 26.3.0.39-beta on 26.3", builds)
+        self.assertIn("Forge 62.0.9 on 26.1, 63.0.2 on 26.1.1, 66.0.9 on 26.3", builds)
+        self.assertLess(notes.index("(beta) "), notes.index(f"Built from {SHA_A}"))
+
+    def test_notes_have_no_beta_line_without_betas(self):
+        self.assertNotIn("(beta)", self.notes(PINS_26_ALL))
+        self.assertNotIn("(beta)", self.notes(PROPS_1_21_11, "band/1.21.11"))
+
+    def test_gradle_properties_plan_one_jar_on_every_loader_and_pin(self):
+        # The band as committed: one jar, and a verify job per loader and pin but Fabric's base (owner answer 34).
+        props = release.read_properties(GRADLE_PROPERTIES)
+        band = release.band_layout("band/26.1", props)
+        fabric = release.pins_for(props, "fabric_api")
+        self.assertEqual([jar.name(band.archives, "1.2.0") for jar in band.jars],
+                         [f"ctcl-1.2.0+{band.label}-Fabric-Quilt-Forge-NeoForge.jar"])
+        self.assertEqual({r.loader: list(r.versions) for r in band.jars[0].loaders},
+                         {loader: fabric for loader in ("Fabric", "Quilt", "Forge", "NeoForge")})
+        self.assertEqual(len(band.matrix), (len(fabric) - 1) + 2 * len(fabric))
 
 
 class PublishGuardTest(unittest.TestCase):

@@ -1,0 +1,17 @@
+modLoader = "javafml"
+# The same javafml floor as the mod: this jar is built on the base and runs on every pin (forge/build.gradle).
+loaderVersion = "${fml_range}"
+license = "MIT"
+
+[[mods]]
+modId = "ctcl_gametest"
+version = "1.0.0"
+displayName = "CTCL game tests"
+description = '''The CTCL server gametests. Test-only: never shipped.'''
+
+[[dependencies.ctcl_gametest]]
+modId = "ctcl"
+mandatory = true
+versionRange = "*"
+ordering = "AFTER"
+side = "BOTH"

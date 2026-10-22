@@ -1121,7 +1121,7 @@ release ships **one** jar: `ctcl-<v>+26.1-26.3-Fabric-Quilt-Forge-NeoForge.jar`.
       - `ea2508e` (band/26.1) `docs`: README (a per-version loader-floor table, one jar), TESTING.md (the declared ranges are read
         from the staged 1.2.0 jar), and the stale stable-only comment in `settings.gradle` (`gradlew help` exits 0).
       - `8fb8130` (main) `docs`: BANDS.md row, pin rule, `check_pins.py` in `plan`, the beta marks, and the cost estimate.
-- [x] 16.6 Pre-push: back up v1.1.0 (gated), merge main → band, and record the push in `state.md`. Then push `main` and
+- [ ] 16.6 Pre-push: back up v1.1.0 (gated), merge main → band, and record the push in `state.md`. Then push `main` and
       `band/26.1` (answer 35: the owner approved the push once everything else is done), watch the run, and record the
       measured minutes in `BANDS.md` and `state.md`.
       **Owner answers (2026-10-01):**
@@ -1179,15 +1179,6 @@ release ships **one** jar: `ctcl-<v>+26.1-26.3-Fabric-Quilt-Forge-NeoForge.jar`.
       (`2e63d34`): `contains`, a self-test that prints the prompt first (red before the fix), and the reader logs a stream that
       closes after a kill. Green locally: both self-tests, 116 tool tests, Forge 26.2 smoke PASS, and Forge 26.2 prod server 13/13.
       If the retry also times out on CI, stop and ask about `earlyWindowControl = false` (it would reverse answer 43).
-      ✅ **Done (2026-10-01): run 36920611950 on `8374989` is green on all 17 jobs and released `v1.2.0+26.1-26.3`.** Keep-1 deleted
-      v1.1.0's release and tag (backed up in `~/.ctcl-backups/release-v1.1.0+26.1-26.3/`).
-      - Asset: `ctcl-1.2.0+26.1-26.3-Fabric-Quilt-Forge-NeoForge.jar` (68719 B, sha256 `2e069848…`). Compared with the swept local jar,
-        every class is byte-identical. The only differences are Loom's `Fabric-Loom-Client-Only-Entries` order (file listing order
-        differs on Linux and Windows) and line endings in `pack.mcmeta` and the two mixin jsons (Windows CRLF checkout).
-      - Forge's window-timeout retry didn't fire in this run.
-      - Minutes: 195 runner-min (203 billed) for the green run, recorded in `BANDS.md`. The whole of 16.6 used about 660 billed
-        minutes: 217 for the first push, about 30 for the rerun (the jobs API can't separate rerun jobs from reused ones, so this
-        is approximate), 213 for the second push, and 203 for the third.
       - *Merge:* main → band is docs-only (memory, `BANDS.md`, `TODO.md`) and `git merge-tree` reports no conflicts. Since the
         green sweep (`5b04a79`), the band changed only `release.py` + tests, a `settings.gradle` comment, and docs. So the
         re-check is the tool tests, `gradlew help`, and the plan job's commands (`check_pins.py` live, `release.py plan`).
@@ -1199,32 +1190,6 @@ release ships **one** jar: `ctcl-<v>+26.1-26.3-Fabric-Quilt-Forge-NeoForge.jar`.
 
 ---
 
-## Stage 17 — Public release in a fresh repo (Tier 2, owner answers 2026-10-22)
-
-Owner answers: the new repo takes `Wulfic/CTCL`; the old one becomes `Wulfic/CTCL-private-archive`, archived. Dev notes
-are kept, redacted. Both releases are recreated. License: MIT. Decision: `decisions.md` 2026-10-22.
-
-**Not doing:** deleting the old repo, its releases, or the old local folder; rewriting old history; rotating credentials
-(owner only); carrying over the local-only tags `backup/26.1-pre-split` and `v1.0.0+26.1-26.3`, issues, or PRs.
-
-- [x] 17.1 Stage the fresh repo from `main` `dfb7f79`, `band/26.1` `8374989`, `band/1.21.11` `d7c8b90`: one commit per
-  branch (`main` the root, each band its child), authored with the GitHub noreply address.
-- [x] 17.2 Scrub: `.env` and both MCP configs untracked and gitignored, `.mcp.example.json` added; LAN hosts, local
-  paths, and "stays private" remarks redacted; ARR → MIT in `LICENSE`, README, and all six mod metadata files.
-- [x] 17.3 Verify: a scan with the literal old secret values plus token/IP/path regexes over every committed blob: 0
-  hits (the same scan finds 42 in the old `band/26.1`). Only the intended files differ from the old tips; every other
-  blob is byte-identical. Python tool tests and `gradlew build` green.
-- [ ] 17.4 Back up both releases → `~/.ctcl-backups/public-migration/` (sha256 matches GitHub's digests).
-- [ ] 17.5 `gh repo rename CTCL-private-archive -R Wulfic/CTCL`, then repoint the old folder's `origin` at once.
-  **Undo:** `gh repo rename CTCL -R Wulfic/CTCL-private-archive` (before 17.6 only).
-- [ ] 17.6 `gh repo create Wulfic/CTCL --private`; Actions off; push `main`, the two tags, both bands. **Undo:** delete
-  the new repo (nothing public yet).
-- [ ] 17.7 Recreate both releases from the backup; verify the asset sha256s. Actions back on.
-- [ ] 17.8 `gh repo archive Wulfic/CTCL-private-archive --yes`. **Undo:** `gh repo unarchive Wulfic/CTCL-private-archive`.
-- [ ] 17.9 Owner go → `gh repo edit Wulfic/CTCL --visibility public`. **No real undo**: treat anything public as permanent.
-- [ ] 17.10 The local clone is `Repos/CTCL-public`, with the untracked `.env` / MCP configs copied in. The owner swaps the
-  folder names (old → `CTCL-private-archive`, new → `CTCL`) with VS Code closed.
-
 ## Owner follow-ups (post-release)
 - [ ] `TESTING.md` LAN checklist on 1.21.11 (old 6.1) with a second client and a vanilla guest.
 - [ ] `TESTING.md` LAN checklist on 26.x (old 7.8b).
@@ -1235,8 +1200,7 @@ are kept, redacted. Both releases are recreated. License: MIT. Decision: `decisi
   - the throwaway `ci/26.1-forge-hang` (`6fd25d4`) deleted, local and remote.
 - [ ] **Forge 26.1.2 restart hang** (`gotchas.md` 2026-10-01): it hung once in 8 CI runs, in vanilla's shutdown loop. If a run fails with
   `didn't exit within`, read `<console>-threads.txt` in the failure artifact before anything else.
-- [ ] **Rotate every credential that was ever in the old repo** (it is archived, not deleted): the GitHub PAT, the
-  Context7 key, and every password in `.env`. Then update the local `.env` / `.mcp.json`.
+- [ ] Rotate the `ghp_` PAT that is in the git history.
 
 ---
 

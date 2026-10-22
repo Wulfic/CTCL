@@ -1,0 +1,7 @@
+{
+	"type": "minecraft:function",
+	"function": "ctcl_gametest:networking/a_cycle_from_the_open_table_menu_advances_the_size",
+	"environment": "minecraft:default",
+	"structure": "minecraft:empty",
+	"max_ticks": 100
+}

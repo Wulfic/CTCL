@@ -1,0 +1,7 @@
+{
+	"type": "minecraft:function",
+	"function": "ctcl_gametest:loader/cycling_back_to_off_releases_every_chunk",
+	"environment": "minecraft:default",
+	"structure": "minecraft:empty",
+	"max_ticks": 200
+}

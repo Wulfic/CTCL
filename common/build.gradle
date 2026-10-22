@@ -1,0 +1,66 @@
+// Loader-neutral code: Minecraft (Mojang names) plus the Mixin annotations, and nothing from any
+// loader. A Fabric, NeoForge, or Forge import here doesn't compile, which keeps common/ portable.
+// Each loader project adds these source dirs to its own and builds its jar from them.
+plugins {
+	id 'net.fabricmc.fabric-loom'
+}
+
+base {
+	archivesName = "${project.archives_base_name}-common"
+}
+
+loom {
+	splitEnvironmentSourceSets()
+}
+
+sourceSets {
+	// Server gametest bodies, registered by each loader's gametest mod.
+	gametest {
+		compileClasspath += main.compileClasspath + main.output
+	}
+	// The client smoke driver, for loaders with no client gametest API (NeoForge, Forge).
+	gametestClient {
+		compileClasspath += client.compileClasspath + client.output + main.output
+	}
+}
+
+// Compiling the gametest sources here is the guard that they stay loader-free, like main's.
+tasks.named("check") {
+	dependsOn "gametestClasses", "gametestClientClasses"
+}
+
+configurations {
+	// Mockito's inline mock maker, attached as an agent (JDK 21+ warns on self-attach).
+	mockitoAgent
+}
+
+dependencies {
+	minecraft "com.mojang:minecraft:${project.minecraft_version}"
+	compileOnly "net.fabricmc:sponge-mixin:${project.sponge_mixin_version}"
+
+	testImplementation platform("org.junit:junit-bom:${project.junit_version}")
+	testImplementation "org.junit.jupiter:junit-jupiter"
+	testRuntimeOnly "org.junit.platform:junit-platform-launcher"
+	testImplementation "org.mockito:mockito-core:${project.mockito_version}"
+	testImplementation "org.mockito:mockito-junit-jupiter:${project.mockito_version}"
+	// Runs tests under Fabric's Knot classloader so Minecraft classes can be bootstrapped. Test-only:
+	// the loader is a harness here, never a dependency of the shipped code.
+	testImplementation "net.fabricmc:fabric-loader-junit:${project.loader_version}"
+	// Knot needs ASM and Mixin at runtime. Loom adds them only where the loader is an implementation dependency.
+	testRuntimeOnly "net.fabricmc:sponge-mixin:${project.sponge_mixin_version}"
+	mockitoAgent("org.mockito:mockito-core:${project.mockito_version}") {
+		transitive = false
+	}
+}
+
+test {
+	useJUnitPlatform()
+	def agent = configurations.mockitoAgent
+	jvmArgumentProviders.add({ ["-javaagent:${agent.singleFile}"] } as CommandLineArgumentProvider)
+	// The agent appends to the boot classpath, which disables CDS and makes the JVM warn about it.
+	jvmArgs "-Xshare:off"
+	testLogging {
+		events "failed"
+		exceptionFormat = "full"
+	}
+}

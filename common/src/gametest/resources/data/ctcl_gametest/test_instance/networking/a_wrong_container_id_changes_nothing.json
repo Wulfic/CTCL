@@ -1,0 +1,7 @@
+{
+	"type": "minecraft:function",
+	"function": "ctcl_gametest:networking/a_wrong_container_id_changes_nothing",
+	"environment": "minecraft:default",
+	"structure": "minecraft:empty",
+	"max_ticks": 100
+}

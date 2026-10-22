@@ -1,0 +1,163 @@
+// Version helpers shared by the loader projects (apply from: rootProject.file('gradle/pins.gradle')).
+// Each loader pins one build per Minecraft version it supports as <prefix>.<mc> in gradle.properties.
+// A version with no pin is one that loader skips (the owner's stable-only rule, decisions.md 2026-09-29).
+
+def versionParts = { String v -> v.tokenize('.').collect { it as int } }
+
+def compareVersions = { String a, String b ->
+	def x = versionParts(a), y = versionParts(b)
+	for (int i = 0; i < Math.max(x.size(), y.size()); i++) {
+		int c = (i < x.size() ? x[i] : 0) <=> (i < y.size() ? y[i] : 0)
+		if (c != 0) return c
+	}
+	return 0
+}
+
+// 26.1.2 -> 26.1: the release line a Minecraft version belongs to.
+def releaseLine = { String v -> versionParts(v).take(2).join('.') }
+
+// 26.1 -> 26.2: the first version past a release line, for exclusive range bounds.
+def nextLine = { String line ->
+	def parts = versionParts(line)
+	"${parts[0]}.${parts[1] + 1}".toString()
+}
+
+// Every <prefix>.<mc> pin as [mc: value], in Minecraft version order.
+def pinsFor = { String prefix ->
+	def pins = project.properties.findAll { it.key.startsWith("${prefix}.") }
+		.collectEntries { [(it.key.substring(prefix.length() + 1)): it.value.toString()] }
+	pins.keySet().sort(compareVersions).collectEntries { [(it): pins[it]] }
+}
+
+// What a loader with <prefix>.<mc> pins builds (NeoForge, Forge). settings.gradle leaves the project out for an explicit
+// -Pminecraft_version with no pin; with no -P, the loader builds its release jar on its own base, the lowest pin.
+// loaderBound(upTo, pin) is the exclusive upper bound of the loader builds one pinned Minecraft version accepts, where
+// upTo is the next pinned version on its release line, or the next line after the line's last pin. Returns
+// [minecraft, loaderVersion, isReleaseBuild, label, minecraftRange, loaderRange].
+def loaderPlan = { String prefix, String loaderName, Closure loaderBound ->
+	def pins = pinsFor(prefix)
+	if (pins.isEmpty()) {
+		throw new GradleException("No ${prefix}.<mc> pins in gradle.properties: ${loaderName}'s version range comes from them")
+	}
+	def pinnedVersions = pins.keySet().toList()
+	def requestedMinecraft = gradle.startParameter.projectProperties.minecraft_version
+	def minecraft = (requestedMinecraft ?: pinnedVersions.first()).toString()
+	def loaderVersion = pins[minecraft]
+	if (!loaderVersion) {
+		throw new GradleException("No ${loaderName} pin for Minecraft ${minecraft}, yet settings.gradle included ${project.name}: add ${prefix}.${minecraft} or check settings.gradle")
+	}
+
+	// The release lines must be contiguous: a skipped line in the middle would need a jar of its own, and this
+	// build makes one jar per loader, so it fails rather than declare a version the loader skips.
+	def releaseLines = pinnedVersions.collect { releaseLine(it) }.unique()
+	releaseLines.eachWithIndex { line, i ->
+		if (i > 0 && nextLine(releaseLines[i - 1]) != line) {
+			throw new GradleException("${loaderName} pins skip the release line(s) between ${releaseLines[i - 1]} and ${line}: one jar can't cover a gap")
+		}
+	}
+
+	// Built on the base (the lowest pin), the jar is the release jar: it declares every pinned version from the base
+	// up to the end of the highest release line. Any other -Pminecraft_version builds a jar for that line alone,
+	// which the per-version suite and checkReleaseJarBytes use.
+	def isReleaseBuild = minecraft == pinnedVersions.first()
+	def baseMinecraft = pinnedVersions.first()
+	def top = releaseLine(baseMinecraft) == releaseLines.last() ? pinnedVersions.last() : releaseLines.last()
+	def label = !isReleaseBuild ? minecraft : baseMinecraft == top ? baseMinecraft : "${baseMinecraft}-${top}"
+	def minecraftRange = isReleaseBuild ? "[${baseMinecraft},${nextLine(releaseLines.last())})" : "[${minecraft},${nextLine(releaseLine(minecraft))})"
+	// One range per pinned version, not per line: Forge gives each Minecraft version its own major, so a line's lowest pin
+	// would reject the line's later versions. Each pin accepts its build and newer, up to the next pin on its line; the
+	// line's last pin runs to the end of the line (the owner's calls, 2026-09-29 and 2026-10-01 answer 29).
+	def declaredVersions = isReleaseBuild ? pinnedVersions : [minecraft]
+	def loaderRange = declaredVersions.collect { mc ->
+		def upTo = pinnedVersions.find { releaseLine(it) == releaseLine(mc) && compareVersions(it, mc) > 0 } ?: nextLine(releaseLine(mc))
+		"[${pins[mc]},${loaderBound(upTo, pins[mc])})"
+	}.join(",")
+	[minecraft: minecraft, loaderVersion: loaderVersion, isReleaseBuild: isReleaseBuild, label: label.toString(), minecraftRange: minecraftRange.toString(), loaderRange: loaderRange]
+}
+
+// checkLoaderRange: proves the processed mods file (tomlPath, under processResources' output) declares every loader build
+// and Minecraft version this jar claims, as FML itself reads the ranges: with the maven-artifact on this loader's runtime
+// classpath. The release jar claims every pin; any other build claims its own. jar depends on it, so no jar ships a range
+// that rejects one of its own pins.
+// language (optional): [version: { build -> the javafml version that loader build provides }, alsoIn: [ProcessResources
+// task names]]. Then the loaderVersion of tomlPath, in processResources' output and in each alsoIn task's, must accept
+// every claimed build's javafml version too. A test mod built on the base runs on every pin, so it needs the same floor.
+def registerLoaderRangeCheck = { Map plan, String prefix, String tomlPath, String loaderModId, Map language = null ->
+	def check = tasks.register("checkLoaderRange") {
+		group = "verification"
+		description = "Proves ${tomlPath}'s ${loaderModId} and minecraft ranges accept every pin this jar claims."
+		def processResources = tasks.named("processResources", ProcessResources)
+		dependsOn processResources
+		language?.alsoIn?.each { dependsOn it }
+		def claimed = plan.isReleaseBuild ? pinsFor(prefix) : [(plan.minecraft): plan.loaderVersion]
+		// No declared inputs or outputs, so it always runs (about a second). Forge's merged source sets put processResources'
+		// output in compileJava's dir, and declaring the file as an input trips Gradle's implicit-dependency check there.
+		doLast {
+			def toml = new File(processResources.get().destinationDir, tomlPath)
+			if (!toml.isFile()) {
+				throw new GradleException("checkLoaderRange: ${toml} is missing, so nothing proves the declared ranges")
+			}
+			// Each [[dependencies.ctcl]] block's versionRange, by modId.
+			def ranges = toml.getText("UTF-8").split(/\[\[dependencies\.ctcl\]\]/).drop(1).collectEntries { block ->
+				def modId = (block =~ /(?m)^modId\s*=\s*"([^"]+)"/)
+				def range = (block =~ /(?m)^versionRange\s*=\s*"([^"]*)"/)
+				modId.find() && range.find() ? [(modId.group(1)): range.group(1)] : [:]
+			}
+			[loaderModId, "minecraft"].each { id ->
+				if (!ranges[id] || ranges[id].contains('${')) {
+					throw new GradleException("checkLoaderRange: ${toml} has no expanded versionRange for ${id}: ${ranges[id]}")
+				}
+			}
+
+			def mavenArtifact = configurations.runtimeClasspath.incoming.resolutionResult.allComponents
+				.find { it.moduleVersion?.group == "org.apache.maven" && it.moduleVersion?.name == "maven-artifact" }?.moduleVersion?.version
+			if (!mavenArtifact) {
+				throw new GradleException("checkLoaderRange: no org.apache.maven:maven-artifact on ${project.path}'s runtime classpath, so FML's range parser can't be loaded")
+			}
+			def urls = configurations.detachedConfiguration(dependencies.create("org.apache.maven:maven-artifact:${mavenArtifact}"))
+				.files.collect { it.toURI().toURL() } as URL[]
+			def loader = new URLClassLoader(urls, (ClassLoader) null)
+			try {
+				def versionRange = loader.loadClass("org.apache.maven.artifact.versioning.VersionRange")
+				def artifactVersion = loader.loadClass("org.apache.maven.artifact.versioning.DefaultArtifactVersion")
+				def accepts = { String range, String version ->
+					versionRange.createFromVersionSpec(range).containsVersion(artifactVersion.getConstructor(String).newInstance(version))
+				}
+				def rejected = claimed.collectMany { mc, build ->
+					(accepts(ranges[loaderModId], build) ? [] : ["${loaderModId} ${build} (Minecraft ${mc}) is outside ${ranges[loaderModId]}"]) +
+						(accepts(ranges.minecraft, mc) ? [] : ["minecraft ${mc} is outside ${ranges.minecraft}"])
+				}
+				if (language) {
+					def tomls = [toml] + language.alsoIn.collect { new File(tasks.named(it, ProcessResources).get().destinationDir, tomlPath) }
+					tomls.each { file ->
+						def declared = file.isFile() ? (file.getText("UTF-8") =~ /(?m)^loaderVersion\s*=\s*"([^"]*)"/) : null
+						if (!declared?.find() || declared.group(1).contains('${')) {
+							throw new GradleException("checkLoaderRange: ${file} has no expanded loaderVersion")
+						}
+						def range = declared.group(1)
+						rejected += claimed.collectMany { mc, build ->
+							def provided = language.version(build).toString()
+							accepts(range, provided) ? [] : ["javafml ${provided} (${loaderModId} ${build}, Minecraft ${mc}) is outside ${file}'s loaderVersion ${range}"]
+						}
+					}
+				}
+				if (rejected) {
+					throw new GradleException("checkLoaderRange: ${toml.name} rejects pins this jar claims:\n  " + rejected.join("\n  "))
+				}
+			} finally {
+				loader.close()
+			}
+			logger.lifecycle("OK: ${toml.name} accepts ${claimed.collect { mc, build -> "${build} on ${mc}" }.join(', ')} (maven-artifact ${mavenArtifact})")
+		}
+	}
+	tasks.named("jar") { dependsOn check }
+	tasks.named("check") { dependsOn check }
+}
+
+ext.versionParts = versionParts
+ext.compareVersions = compareVersions
+ext.releaseLine = releaseLine
+ext.nextLine = nextLine
+ext.pinsFor = pinsFor
+ext.loaderPlan = loaderPlan
+ext.registerLoaderRangeCheck = registerLoaderRangeCheck

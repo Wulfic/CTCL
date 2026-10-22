@@ -1,0 +1,7 @@
+{
+	"type": "minecraft:function",
+	"function": "ctcl_gametest:networking/a_player_out_of_reach_changes_nothing",
+	"environment": "minecraft:default",
+	"structure": "minecraft:empty",
+	"max_ticks": 100
+}

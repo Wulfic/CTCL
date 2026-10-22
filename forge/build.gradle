@@ -1,0 +1,218 @@
+// The Forge jar (TODO Stage 14). Like fabric/ and neoforge/, it compiles common/'s sources itself, so the jar is
+// self-contained and checkReleaseJarBytes compares like with like. ForgeGradle 7 doesn't apply `java`
+// (gotchas.md 2026-09-29), so the project applies it itself.
+plugins {
+	id 'java'
+	id 'net.minecraftforge.gradle'
+}
+
+def common = project(':common')
+apply from: rootProject.file('gradle/pins.gradle')
+apply from: rootProject.file('gradle/harness.gradle')
+
+// One Forge build per Minecraft version it runs, as forge.<mc> (gradle/pins.gradle): the recommended build, or the latest
+// where there is none (owner answer 27). Each Minecraft version has its own major (62 is 26.1, 63 is 26.1.1, 64 is
+// 26.1.2), so each version accepts its pin up to the next major.
+def plan = loaderPlan("forge", "Forge", { String upTo, String pin -> "${versionParts(pin)[0] + 1}".toString() })
+def forgeMinecraft = plan.minecraft
+def forgeVersion = plan.loaderVersion
+// mods.toml's loaderVersion is the Forge major. This build's pin is the lowest build the jar declares.
+def fmlMajor = versionParts(forgeVersion)[0]
+
+version = "${project.mod_version}+${plan.label}"
+group = project.maven_group
+logger.lifecycle("CTCL ${version} for Forge: Minecraft ${forgeMinecraft}, Forge ${forgeVersion}, declares minecraft ${plan.minecraftRange}, forge ${plan.loaderRange}")
+
+base {
+	archivesName = project.archives_base_name
+}
+
+// ctcl-<mod>+<range>-Forge.jar: the loaders go on as the classifier, as in fabric/ and neoforge/.
+tasks.named("jar", Jar) {
+	archiveClassifier = "Forge"
+	// Forge reads mixin configs only from the manifest; NeoForge's [[mixins]] are invisible to it (gotchas.md 2026-09-29).
+	manifest.attributes("MixinConfigs": "ctcl.mixins.json,ctcl.client.mixins.json")
+}
+// The root's releaseJars merges this jar with every other loader's of the same label (gradle/release.gradle).
+if (plan.isReleaseBuild) {
+	ext.releaseJar = [label: plan.label, loaders: ["Forge"], jar: tasks.named("jar", Jar)]
+}
+
+sourceSets {
+	main {
+		java.srcDirs common.file('src/main/java'), common.file('src/client/java')
+		resources.srcDirs common.file('src/main/resources'), common.file('src/client/resources')
+	}
+	// The gametest mod (ctcl_gametest): common/'s case bodies, client smoke test, and test instance JSON, plus the Forge
+	// registration.
+	gametest {
+		java.srcDirs common.file('src/gametest/java'), common.file('src/gametestClient/java')
+		resources.srcDir common.file('src/gametest/resources')
+	}
+}
+
+repositories {
+	// Mavenizer's repo serves net.minecraftforge:forge without the installer, and Gradle looks for an artifact only in the
+	// repo that had its module, so the harness's installer configuration skips it and resolves from Forge's Maven.
+	minecraft.mavenizer(it).content { notForConfigurations("prodInstaller") }
+	maven fg.forgeMaven
+	maven fg.minecraftLibsMaven
+	mavenCentral()
+}
+
+configurations {
+	gametestImplementation.extendsFrom implementation
+}
+
+dependencies {
+	implementation minecraft.dependency("net.minecraftforge:forge:${forgeMinecraft}-${forgeVersion}")
+	gametestImplementation sourceSets.main.output
+}
+
+// One run dir per Minecraft version: an older version can't read a world a newer one saved (gotchas.md 2026-09-24).
+def gameTestRunDir = layout.buildDirectory.dir("run/gameTestServer/${forgeMinecraft}")
+
+// The gametest mod as a jar, for the production harness. The loader is in the name, so a directory holding every
+// loader's jars still has exactly one Forge gametest jar.
+def gametestJar = tasks.register("gametestJar", Jar) {
+	archiveClassifier = "Forge-gametest"
+	from sourceSets.gametest.output
+}
+
+// Production harness (gradle/harness.gradle): prebuilt jars in a real Forge server and client that Forge's own
+// installer made.
+def argsFileName = File.pathSeparator == ";" ? "win_args.txt" : "unix_args.txt"
+def launchPath = "libraries/net/minecraftforge/forge/${forgeMinecraft}-${forgeVersion}/${argsFileName}".toString()
+def harness = loaderHarness(
+	loader: "Forge",
+	minecraft: forgeMinecraft,
+	loaderVersion: forgeVersion,
+	installer: "net.minecraftforge:forge:${forgeMinecraft}-${forgeVersion}:installer",
+	installArgs: { String side, File dir -> ["--install${side.capitalize()}".toString(), dir.absolutePath] },
+	serverLaunch: launchPath,
+	clientVersion: "${forgeMinecraft}-forge-${forgeVersion}".toString(),
+	metadata: ["META-INF/mods.toml"],
+	gametestJar: gametestJar,
+	// Forge refuses a vanilla client in the handshake, before it has a name, if a required channel rejects vanilla.
+	guestRefusal: /Disconnecting VANILLA connection attempt/)
+
+minecraft {
+	runs {
+		// ./gradlew runGametestGameTestServer: every CTCL case headless through vanilla's gametest main, then exits with
+		// the failed-required count. ForgeGradle makes a task per source set; the gametest one has both mods.
+		register('gameTestServer') {
+			workingDir = gameTestRunDir
+			// Forge ticks the test runner only when this gate is on, and outside production only (TODO Stage 14 facts).
+			systemProperty 'forge.gameTestServer', 'true'
+			systemProperty 'eventbus.api.strictRuntimeChecks', 'true'
+			// Absolute paths: vanilla deletes and recreates the universe dir each run, so it must stay inside the run
+			// dir; and a relative report path has no parent to create (gotchas.md 2026-09-29).
+			args '--universe', gameTestRunDir.get().file("gametestserver").asFile.absolutePath,
+				'--report', gameTestRunDir.get().file("report.xml").asFile.absolutePath
+			// The jar's manifest names the mixin configs, but a dev run loads the source set dirs, which have none.
+			args '--mixin.config', 'ctcl.mixins.json', '--mixin.config', 'ctcl.client.mixins.json'
+			mods {
+				ctcl {
+					source sourceSets.main
+				}
+				ctcl_gametest {
+					source sourceSets.gametest
+				}
+			}
+		}
+	}
+}
+
+// `check` runs the server gametests, like Fabric's runGameTest and NeoForge's runGameTestServer. Never next to another
+// game JVM: two at once exhaust this machine's commit limit (gotchas.md 2026-09-24). ForgeGradle registers its run tasks
+// after this script, so the task is matched lazily; `check` names it, so a missing task still fails the build.
+tasks.matching { it.name == "runGametestGameTestServer" }.configureEach {
+	mustRunAfter ":common:test", ":fabric:runGameTest"
+	// settings.gradle leaves NeoForge out for a version it skips.
+	if (findProject(":neoforge")) {
+		mustRunAfter ":neoforge:runGameTestServer"
+	}
+	outputs.upToDateWhen { false }
+	def report = gameTestRunDir.get().file("report.xml").asFile
+	doFirst {
+		gameTestRunDir.get().asFile.mkdirs()
+		// A stale report from an earlier run must never pass this one.
+		report.delete()
+	}
+	doLast { harness.checkGameTestReport(report) }
+}
+tasks.named("check") {
+	dependsOn "runGametestGameTestServer"
+}
+
+// Forge has no production gametest launcher, and ticks the test runner only outside production (TODO Stage 14 facts),
+// so a normal Forge server runs the tests: with -Dctcl.gameTestReport, the gametest mod starts vanilla's runner once
+// the server is up, ticks it, writes the report, and stops the server (ProdGameTests).
+tasks.register("prodServerGameTest") {
+	group = "verification"
+	description = "Runs the CTCL gametests from prebuilt jars in a normal Forge server, then restarts it on the saved world."
+	dependsOn harness.installServer
+	inputs.files(harness.prodJars)
+	outputs.upToDateWhen { false }
+	doLast {
+		def dir = harness.prodServerDir.get().asFile
+		harness.stageMods(dir, harness.pickProdJars())
+		new File(dir, "eula.txt").text = "eula=true\n"
+		int port = new ServerSocket(0).withCloseable { it.localPort }
+		// A fresh file each run: vanilla fills in every other setting. The cases need vanilla's flat test world (the
+		// classic layers, spelled out: an empty generator-settings logs an error), and an empty server must not pause
+		// its ticks while they run.
+		def flatLayers = '{"layers":[{"block":"minecraft:bedrock","height":1},{"block":"minecraft:dirt","height":2},{"block":"minecraft:grass_block","height":1}],"biome":"minecraft:plains"}'
+		new File(dir, "server.properties").setText("online-mode=false\nserver-port=${port}\nlevel-type=minecraft:flat\ngenerator-settings=${flatLayers}\ngenerate-structures=false\npause-when-empty-seconds=0\nmotd=CTCL production gametests\n", "UTF-8")
+		// A new world each run, never a reused one: a restart on an earlier run's world could pass the restore check on
+		// that run's tables. Old worlds stay until ./gradlew :forge:clean.
+		def universe = new File(dir, "worlds")
+		universe.mkdirs()
+		def worldName = "gametest-" + new Date().format("yyyyMMdd-HHmmss")
+		if (new File(universe, worldName).exists()) {
+			throw new GradleException("${new File(universe, worldName)} already exists; run again in a second")
+		}
+		def worldArgs = ["--universe", universe.absolutePath, "--world", worldName, "nogui"]
+		def report = new File(dir, "report.xml")
+		// A report from an earlier run must never pass this one.
+		report.delete()
+		int exit = harness.runServer(dir, launchPath, worldArgs, "gametest-console.log", false, ["-Dctcl.gameTestReport=${report.absolutePath}".toString()])
+		if (exit != 0) {
+			throw new GradleException("The Forge gametest server exited with ${exit}. Console: ${new File(dir, 'gametest-console.log')}")
+		}
+		harness.checkGameTestReport(report)
+
+		// A normal boot on the world the tests saved, without the property: it must restore the loaders, then stop cleanly.
+		int restartExit = harness.runServer(dir, launchPath, worldArgs, "restart-console.log", true)
+		if (restartExit != 0) {
+			throw new GradleException("The Forge server restart exited with ${restartExit}. Console: ${new File(dir, 'restart-console.log')}")
+		}
+		harness.checkRestored(new File(dir, "restart-console.log"))
+		logger.lifecycle("Forge saved the gametest world at ${new File(universe, worldName)}")
+	}
+}
+
+processResources {
+	def properties = [version: project.version.toString(), minecraft_range: plan.minecraftRange, forge_range: plan.loaderRange,
+		fml_range: "[${fmlMajor},)".toString()]
+	inputs.properties properties
+	filesMatching("META-INF/mods.toml") {
+		expand properties
+	}
+}
+
+tasks.named("processGametestResources", ProcessResources) {
+	def properties = [fml_range: "[${fmlMajor},)".toString()]
+	inputs.properties properties
+	filesMatching("META-INF/mods.toml") {
+		expand properties
+	}
+}
+
+// Forge's javafml version is its major. The gametest mod is built once on the base and runs on every pin.
+registerLoaderRangeCheck(plan, "forge", "META-INF/mods.toml", "forge",
+	[version: { String build -> versionParts(build)[0] }, alsoIn: ["processGametestResources"]])
+
+java {
+	withSourcesJar()
+}

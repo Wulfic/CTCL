@@ -1,0 +1,183 @@
+// The NeoForge jar (TODO Stage 13). Like fabric/, it compiles common/'s sources itself, so the jar is
+// self-contained and checkReleaseJarBytes compares like with like.
+plugins {
+	id 'net.neoforged.moddev'
+}
+
+def common = project(':common')
+apply from: rootProject.file('gradle/pins.gradle')
+apply from: rootProject.file('gradle/harness.gradle')
+
+// One NeoForge build per Minecraft version it runs, as neoforge.<mc> (gradle/pins.gradle): the stable build, or a beta
+// where there is none (owner answer 27). NeoForge versions start with their Minecraft version (26.1 is 26.1.0.x), so a
+// pin's builds sort below the next pinned version's.
+def plan = loaderPlan("neoforge", "NeoForge", { String upTo, String pin -> upTo })
+def neoMinecraft = plan.minecraft
+def neoVersion = plan.loaderVersion
+
+version = "${project.mod_version}+${plan.label}"
+group = project.maven_group
+logger.lifecycle("CTCL ${version} for NeoForge: Minecraft ${neoMinecraft}, NeoForge ${neoVersion}, declares minecraft ${plan.minecraftRange}, neoforge ${plan.loaderRange}")
+
+base {
+	archivesName = project.archives_base_name
+}
+
+// ctcl-<mod>+<range>-NeoForge.jar: the loaders go on as the classifier, as in fabric/.
+tasks.named("jar", Jar) {
+	archiveClassifier = "NeoForge"
+}
+// The root's releaseJars merges this jar with every other loader's of the same label (gradle/release.gradle).
+if (plan.isReleaseBuild) {
+	ext.releaseJar = [label: plan.label, loaders: ["NeoForge"], jar: tasks.named("jar", Jar)]
+}
+
+sourceSets {
+	main {
+		java.srcDirs common.file('src/main/java'), common.file('src/client/java')
+		resources.srcDirs common.file('src/main/resources'), common.file('src/client/resources')
+	}
+	// The gametest mod (ctcl_gametest): common/'s case bodies and test instance JSON, plus the NeoForge registration.
+	gametest {
+		java.srcDirs common.file('src/gametest/java'), common.file('src/gametestClient/java')
+		resources.srcDir common.file('src/gametest/resources')
+	}
+}
+
+// One run dir per Minecraft version: an older version can't read a world a newer one saved (gotchas.md 2026-09-24).
+def gameTestRunDir = layout.buildDirectory.dir("run/gameTestServer/${neoMinecraft}")
+
+// The gametest mod as a jar, for the production harness. The loader is in the name, so a directory holding every
+// loader's jars still has exactly one NeoForge gametest jar.
+def gametestJar = tasks.register("gametestJar", Jar) {
+	archiveClassifier = "NeoForge-gametest"
+	from sourceSets.gametest.output
+}
+
+// Production harness (TODO 13.5, gradle/harness.gradle): prebuilt jars in a real NeoForge server and client that
+// NeoForge's own installer made.
+def argsFileName = File.pathSeparator == ";" ? "win_args.txt" : "unix_args.txt"
+def launchPath = "libraries/net/neoforged/neoforge/${neoVersion}/${argsFileName}".toString()
+def harness = loaderHarness(
+	loader: "NeoForge",
+	minecraft: neoMinecraft,
+	loaderVersion: neoVersion,
+	installer: "net.neoforged:neoforge:${neoVersion}:installer",
+	installArgs: { String side, File dir -> ["--install-${side}".toString(), dir.absolutePath] },
+	serverLaunch: launchPath,
+	clientVersion: "neoforge-${neoVersion}".toString(),
+	metadata: ["META-INF/neoforge.mods.toml"],
+	gametestJar: gametestJar)
+
+neoForge {
+	version = neoVersion
+	addModdingDependenciesTo sourceSets.gametest
+
+	mods {
+		ctcl {
+			sourceSet sourceSets.main
+		}
+		ctcl_gametest {
+			sourceSet sourceSets.gametest
+		}
+	}
+
+	runs {
+		// ./gradlew runGameTestServer: every CTCL case headless, then exits with the failed-required count.
+		gameTestServer {
+			type = "gameTestServer"
+			sourceSet = sourceSets.gametest
+			loadedMods = [mods.ctcl, mods.ctcl_gametest]
+			gameDirectory = gameTestRunDir.get().asFile
+			// Absolute paths: vanilla deletes and recreates the universe dir each run, so it must stay inside the run
+			// dir; and a relative report path has no parent to create (gotchas.md 2026-09-29).
+			programArguments.addAll("--universe", gameTestRunDir.get().file("gametestserver").asFile.absolutePath,
+				"--report", gameTestRunDir.get().file("report.xml").asFile.absolutePath)
+		}
+	}
+}
+
+dependencies {
+	gametestImplementation sourceSets.main.output
+}
+
+// `check` runs the server gametests, like Fabric's runGameTest. Never next to another game JVM: two at once exhaust this
+// machine's commit limit (gotchas.md 2026-09-24).
+tasks.named("runGameTestServer") {
+	mustRunAfter ":common:test", ":fabric:runGameTest"
+	outputs.upToDateWhen { false }
+	def report = gameTestRunDir.get().file("report.xml").asFile
+	doFirst {
+		gameTestRunDir.get().asFile.mkdirs()
+		// A stale report from an earlier run must never pass this one.
+		report.delete()
+	}
+	doLast { harness.checkGameTestReport(report) }
+}
+tasks.named("check") {
+	dependsOn "runGameTestServer"
+}
+
+// NeoForge fires no gametest event in a real install, so the tests are vanilla data and the server starts through
+// FML's GameTestServer main (gotchas.md 2026-09-29). Forge has no such main, so this task stays per-loader.
+
+// The universe GameTestMainUtil deletes and recreates each run. Asserted inside the server dir before every use.
+def universeIn = { File serverDir ->
+	def universe = new File(serverDir, "gametestserver")
+	if (!universe.canonicalFile.toPath().startsWith(serverDir.canonicalFile.toPath()) || universe.canonicalFile == serverDir.canonicalFile) {
+		throw new GradleException("Refusing to use ${universe} as the gametest universe: GameTestMainUtil deletes it, and it isn't inside ${serverDir}")
+	}
+	universe
+}
+
+tasks.register("prodServerGameTest") {
+	group = "verification"
+	description = "Runs the CTCL gametests from prebuilt jars on a real NeoForge server, then restarts it on the saved world."
+	dependsOn harness.installServer
+	inputs.files(harness.prodJars)
+	outputs.upToDateWhen { false }
+	doLast {
+		def dir = harness.prodServerDir.get().asFile
+		def jars = harness.pickProdJars()
+		harness.stageMods(dir, jars)
+		new File(dir, "eula.txt").text = "eula=true\n"
+		// FML's production GameTestServer main instead of Server; everything else is the installer's own launch.
+		def launch = new File(dir, launchPath)
+		def tokens = launch.getText("UTF-8").split(/\s+/).toList()
+		if (tokens.count { it == "net.neoforged.fml.startup.Server" } != 1) {
+			throw new GradleException("Expected the main class net.neoforged.fml.startup.Server exactly once in ${launch}")
+		}
+		def gameTestArgs = "ctcl_gametest_${argsFileName}"
+		new File(dir, gameTestArgs).setText(launch.getText("UTF-8").replace("net.neoforged.fml.startup.Server", "net.neoforged.fml.startup.GameTestServer"), "UTF-8")
+
+		def universe = universeIn(dir)
+		def report = new File(dir, "report.xml")
+		report.delete()
+		int exit = harness.runServer(dir, gameTestArgs, ["--universe", universe.absolutePath, "--report", report.absolutePath], "gametest-console.log", false)
+		if (exit != 0) {
+			throw new GradleException("The NeoForge GameTestServer exited with ${exit} (the failed required-test count, or -1 if it stopped early). Console: ${new File(dir, 'gametest-console.log')}")
+		}
+		harness.checkGameTestReport(report)
+
+		// A normal boot on the world the tests saved: it must restore the loaders, then stop cleanly.
+		int restartExit = harness.runServer(dir, launchPath, ["--universe", universeIn(dir).absolutePath, "--world", "gametestworld", "nogui"], "restart-console.log", true)
+		if (restartExit != 0) {
+			throw new GradleException("The NeoForge server restart exited with ${restartExit}. Console: ${new File(dir, 'restart-console.log')}")
+		}
+		harness.checkRestored(new File(dir, "restart-console.log"))
+	}
+}
+
+processResources {
+	def properties = [version: project.version.toString(), minecraft_range: plan.minecraftRange, neoforge_range: plan.loaderRange]
+	inputs.properties properties
+	filesMatching("META-INF/neoforge.mods.toml") {
+		expand properties
+	}
+}
+
+registerLoaderRangeCheck(plan, "neoforge", "META-INF/neoforge.mods.toml", "neoforge")
+
+java {
+	withSourcesJar()
+}

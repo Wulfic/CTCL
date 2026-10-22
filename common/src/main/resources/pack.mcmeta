@@ -1,0 +1,7 @@
+{
+	"pack": {
+		"description": "Crafting Table Chunk Loader",
+		"min_format": 84,
+		"max_format": 121
+	}
+}

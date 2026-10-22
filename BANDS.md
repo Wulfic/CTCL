@@ -79,11 +79,8 @@ There are no PR or scheduled runs. Docs-only changes are skipped. Every Gradle t
   - **NeoForge** and **Forge**, on each of their pins: the loader's build and dev gametests, the byte check, the
     production gametests in a real server install (with the restart restore), the uninstall check on the saved world,
     the client smoke test and a vanilla client joining (under Xvfb), and a Fabric → loader → Fabric world move.
-  - **Cost:** `band/26.1` runs 14 verify jobs per push (4 Fabric, 5 NeoForge, 5 Forge). Measured on the v1.2.0 release run
-    (36920611950, 2026-10-01): **195 runner-minutes, 203 billed** (GitHub rounds each job up to a whole minute). The wall
-    clock was 35 min. The build job takes 12 min and each verify job 7–22 min. So about 9 green pushes a month fit in the
-    2000-minute free limit. A failed push costs about the same, because the jobs run in parallel and one failure doesn't
-    cancel the rest. The 16.4 estimate (146) was low.
+  - **Cost:** `band/26.1` runs 14 verify jobs per push (4 Fabric, 5 NeoForge, 5 Forge). The estimate is about 146
+    runner-minutes a push (v1.1.0's 8 jobs used about 83), so about 13 pushes a month fit in the 2000-minute free limit.
     The owner keeps the full matrix (answer 34). The 1.2.0 push's measured number replaces this estimate.
 - **release:** on a push or a manual run, when `plan` calls for one, and only when every job is green:
   - Bump by conventional commits since the band's last tag: `feat` → minor, `fix`/`perf` →

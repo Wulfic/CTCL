@@ -1,0 +1,429 @@
+import groovy.json.JsonOutput
+import net.fabricmc.loom.task.prod.ClientProductionRunTask
+import net.fabricmc.loom.task.prod.ServerProductionRunTask
+
+// The Fabric jar (Quilt loads it too). It compiles common/'s sources itself, so the jar is
+// self-contained and its classes come from one compile, which checkReleaseJarBytes relies on.
+plugins {
+	id 'net.fabricmc.fabric-loom'
+}
+
+def common = project(':common')
+apply from: rootProject.file('gradle/pins.gradle')
+apply from: rootProject.file('gradle/release.gradle')
+
+// Each Minecraft version the band supports pins its own Fabric API as fabric_api.<mc>.
+def fabricApiVersion = project.findProperty("fabric_api_version") ?: project.findProperty("fabric_api.${project.minecraft_version}")
+if (!fabricApiVersion) {
+	throw new GradleException("No Fabric API pin for Minecraft ${project.minecraft_version}: add fabric_api.${project.minecraft_version} to gradle.properties or pass -Pfabric_api_version")
+}
+
+def pinnedVersions = pinsFor("fabric_api").keySet().toList()
+if (pinnedVersions.isEmpty()) {
+	throw new GradleException("No fabric_api.<mc> pins in gradle.properties: the band's version range comes from them")
+}
+// Built on the band's base (its lowest pin), the jar is the release jar: it declares every pinned release
+// line (26.1, 26.2, ...) and is labelled with the range. Any other -Pminecraft_version builds a jar for
+// that version alone, which is what the per-version recompile suite tests. tools/release.py mirrors this.
+def releaseLines = pinnedVersions.collect { versionParts(it).take(2).join('.') }.unique()
+def isReleaseBuild = project.minecraft_version == pinnedVersions.first()
+def minecraftLabel = !isReleaseBuild ? project.minecraft_version
+		: releaseLines.size() == 1 ? releaseLines.first() : "${releaseLines.first()}-${releaseLines.last()}"
+def minecraftDepends = (isReleaseBuild ? releaseLines : [project.minecraft_version]).collect { "~${it}".toString() }
+
+// Quilt loads this jar on every version with a quilt_loader.<mc> pin. The jar name lists its loaders (the owner's rule,
+// decisions.md 2026-09-29), so Quilt joins the name only when it covers the jar's whole range; a Quilt range that
+// differs would need its own jar, which this build doesn't make, so it fails instead of naming a jar wrongly.
+def quiltPins = project.properties.findAll { it.key.startsWith("quilt_loader.") }.collectEntries { [(it.key.substring("quilt_loader.".length())): it.value.toString()] }
+def quiltOnly = quiltPins.keySet() - pinnedVersions
+if (quiltOnly) {
+	throw new GradleException("quilt_loader pins for ${quiltOnly.sort()} have no fabric_api pin: Quilt runs the Fabric jar, so Fabric must cover them too")
+}
+if (quiltPins && quiltPins.keySet() != (pinnedVersions as Set)) {
+	throw new GradleException("Quilt is pinned for ${quiltPins.keySet().sort(compareVersions)} but Fabric for ${pinnedVersions}: pin Quilt on every version or none")
+}
+def loaders = quiltPins ? ["Fabric", "Quilt"] : ["Fabric"]
+
+version = "${project.mod_version}+${minecraftLabel}"
+group = project.maven_group
+logger.lifecycle("CTCL ${version} for ${loaders.join('/')}: Minecraft ${project.minecraft_version}, Fabric API ${fabricApiVersion}, declares ${minecraftDepends}")
+
+base {
+	archivesName = project.archives_base_name
+}
+
+// ctcl-<mod>+<range>-Fabric-Quilt.jar: the loaders go on as the classifier, so the gametest and sources jars keep theirs.
+tasks.named("jar", Jar) {
+	archiveClassifier = loaders.join("-")
+}
+// The root's releaseJars copies this jar into build/release (gradle/release.gradle).
+if (isReleaseBuild) {
+	ext.releaseJar = [label: minecraftLabel.toString(), loaders: loaders, jar: tasks.named("jar", Jar)]
+}
+
+loom {
+	splitEnvironmentSourceSets()
+
+	mods {
+		"ctcl" {
+			sourceSet sourceSets.main
+			sourceSet sourceSets.client
+		}
+	}
+}
+
+sourceSets {
+	main {
+		java.srcDir common.file('src/main/java')
+		resources.srcDir common.file('src/main/resources')
+	}
+	client {
+		java.srcDir common.file('src/client/java')
+		resources.srcDir common.file('src/client/resources')
+	}
+}
+
+fabricApi {
+	configureTests {
+		// src/gametest: a separate test mod; `build` runs its server gametests headless.
+		createSourceSet = true
+		modId = "ctcl-gametest"
+		enableGameTests = true
+		enableClientGameTests = true
+		eula = true
+		// Client gametests only: Loom 1.17.21 never clears the server gametest world (see gotchas.md).
+		clearRunDirectory = true
+	}
+}
+
+// common/'s server gametest bodies; src/gametest registers them with Fabric's gametest API.
+sourceSets.gametest.java.srcDir common.file('src/gametest/java')
+
+// Before the split, the unit tests and the server gametests ran one after the other in one project.
+// With org.gradle.parallel they'd overlap, and two game-sized JVMs at once exhaust this machine's
+// commit limit (gotchas.md 2026-09-24).
+tasks.named("runGameTest") {
+	mustRunAfter ":common:test"
+}
+
+dependencies {
+	minecraft "com.mojang:minecraft:${project.minecraft_version}"
+	implementation "net.fabricmc:fabric-loader:${project.loader_version}"
+	implementation "net.fabricmc.fabric-api:fabric-api:${fabricApiVersion}"
+}
+
+processResources {
+	def version = project.version
+	def minecraftDependsJson = JsonOutput.toJson(minecraftDepends)
+	inputs.property "version", version
+	inputs.property "minecraft_depends", minecraftDependsJson
+
+	filesMatching("fabric.mod.json") {
+		// The source keeps a quoted placeholder so it stays valid JSON (Loom parses it); the array replaces the whole string.
+		filter { String line -> line.replace('"${minecraft_depends}"', minecraftDependsJson) }
+		expand "version": version
+	}
+}
+
+// The gametest mod as a jar, so the production harness below can run it next to the release jar. The loaders are in
+// the name, so a directory holding every loader's jars still has exactly one Fabric gametest jar.
+def gametestJar = tasks.register("gametestJar", Jar) {
+	archiveClassifier = loaders.join("-") + "-gametest"
+	from sourceSets.gametest.output
+}
+
+// Production harness: runs prebuilt jars in a real Fabric install of -Pminecraft_version. With
+// -Pctcl_prod_mods=<dir> (a directory holding the release jar and its gametest jar, both built on the
+// base version), this proves the shipped bytes run on every version the jar declares. Recompiling for
+// each version can't prove that. Without the property, this build's own jars are used.
+def prodModsDir = project.findProperty("ctcl_prod_mods")
+// Which loader the production gametests install: fabric (default) or quilt. Quilt loads this same Fabric
+// jar (TODO Stage 12), so the release jar is proven on both. Each loader and version gets its own run dir.
+def prodLoader = (project.findProperty("ctcl_loader") ?: "fabric").toString()
+if (!(prodLoader in ["fabric", "quilt"])) {
+	throw new GradleException("-Pctcl_loader must be fabric or quilt, got '${prodLoader}'")
+}
+def isQuilt = prodLoader == "quilt"
+// The fabric-api bundle leaves out the gametest API modules, so those two come from its module dependencies.
+def fabricApiModNames = ~/^(fabric-api|fabric-gametest-api-v1|fabric-client-gametest-api-v1)-\d.*\.jar$/
+def fabricApiMods = configurations.detachedConfiguration(dependencies.create("net.fabricmc.fabric-api:fabric-api:${fabricApiVersion}"))
+		.filter { it.name ==~ fabricApiModNames }
+// From a directory, only the jars whose names list the loader under test (gradle/release.gradle), so it may hold every
+// loader's release and gametest jars.
+def prodLoaderName = isQuilt ? "Quilt" : "Fabric"
+def ctclProdMods = prodModsDir ? fileTree(prodModsDir) { include "*.jar" }.filter { prodLoaderName in jarLoaders(it.name) } : files(tasks.named("jar"), gametestJar)
+// Fails closed unless the task will load exactly the fabric-api mods plus one CTCL jar and one gametest jar.
+// Loom's production tasks add the project's own jar to `mods` by default; a second ctcl jar would let
+// Loader pick either copy, and the run would silently test the wrong bytes.
+def checkProdMods = { Set<File> mods ->
+	def apiJars = fabricApiMods.files
+	if (apiJars.size() != 3) {
+		throw new GradleException("Expected the fabric-api bundle plus its two gametest modules, found ${apiJars*.name}")
+	}
+	def jars = ctclProdMods.files
+	def gametestJars = jars.findAll { jarLoaders(it.name).last() == "gametest" }
+	def modJars = jars - gametestJars
+	if (gametestJars.size() != 1 || modJars.size() != 1) {
+		throw new GradleException("Production gametests need exactly one CTCL jar and one gametest jar whose names list ${prodLoaderName}, found ${jars*.name} in ${prodModsDir ?: 'build/libs'}")
+	}
+	if (mods != apiJars + jars) {
+		throw new GradleException("Production gametest would load unexpected mods: ${(mods - apiJars - jars)*.name}")
+	}
+	logger.lifecycle("Production gametest on Minecraft ${project.minecraft_version}: ${modJars*.name + gametestJars*.name}, Fabric API ${fabricApiVersion}")
+}
+def prodLauncher = javaToolchains.launcherFor { languageVersion = JavaLanguageVersion.of(25) }
+
+// Proves the release jar is byte-for-byte what this version's compile produces. Only fabric.mod.json, the manifest,
+// and the entries of any other loader the release jar's name lists may differ. With that, the full suite run on this
+// version covers the shipped bytes.
+// javac copies compile-time constants into class files, and their values can change between versions
+// (InputConstants.MOUSE_BUTTON_LEFT: 0 on 26.1, 1 on 26.3). This fails on any such drift in mod code.
+tasks.register("checkReleaseJarBytes") {
+	group = "verification"
+	description = "Fails unless the release jar in -Pctcl_prod_mods matches this version's jar byte for byte."
+	def builtJar = tasks.named("jar").flatMap { it.archiveFile }
+	def minecraftVersion = project.minecraft_version
+	inputs.file(builtJar)
+	inputs.files(ctclProdMods)
+	doLast {
+		if (!prodModsDir) {
+			throw new GradleException("checkReleaseJarBytes needs -Pctcl_prod_mods=<dir holding the release jar>")
+		}
+		def releaseJars = ctclProdMods.files.findAll { jarLoaders(it.name).last() != "gametest" }
+		if (releaseJars.size() != 1) {
+			throw new GradleException("Expected one release jar listing ${prodLoaderName} in ${prodModsDir}, found ${releaseJars*.name}")
+		}
+		def release = releaseJars.first()
+		def others = jarLoaders(release.name) - loaders
+		def unknown = others.findAll { !loaderOwned.containsKey(it) }
+		if (unknown) {
+			throw new GradleException("${release.name} lists loader(s) ${unknown} that gradle/release.gradle doesn't know")
+		}
+		def ignored = ["fabric.mod.json", "META-INF/MANIFEST.MF"] + others.collectMany { loaderOwned[it] }
+		def differ = releaseJarDiff(release, builtJar.get().asFile, ignored)
+		if (differ) {
+			throw new GradleException("Release jar ${release.name} is not what Minecraft ${minecraftVersion} compiles to; these entries differ: ${differ}")
+		}
+		logger.lifecycle("Release jar ${release.name} matches the Minecraft ${minecraftVersion} build${others ? " (ignoring ${others.join(', ')}'s entries)" : ''}")
+	}
+}
+
+def quiltLoaderVersion = project.findProperty("quilt_loader.${project.minecraft_version}")
+if (isQuilt && !quiltLoaderVersion) {
+	throw new GradleException("-Pctcl_loader=quilt, but Minecraft ${project.minecraft_version} has no quilt_loader.${project.minecraft_version} pin: Quilt skips this version")
+}
+// -Pctcl_world=<world dir>: the Fabric server starts from a copy of a world another install saved (the cross-loader move,
+// TODO 13.6), in a fresh run dir, so the restart-restore check below applies to it.
+apply from: rootProject.file('gradle/worlds.gradle')
+def worldToImport = project.findProperty("ctcl_world")
+if (worldToImport && isQuilt) {
+	throw new GradleException("-Pctcl_world is for the Fabric production server; the Quilt run doesn't import worlds")
+}
+def prodRunLeaf = (isQuilt ? "quilt-${project.minecraft_version}" : project.minecraft_version) + (worldToImport ? "-${importStamp()}" : "")
+def prodMods = files(fabricApiMods, ctclProdMods)
+
+// Quilt Loader lists its own libraries in its launcher metadata (quilt-loader-<v>.json), like Fabric's installer JSON.
+// Resolved only when a Quilt task runs.
+def quiltLibraries = { String side ->
+	files({
+		def json = configurations.detachedConfiguration(dependencies.create("org.quiltmc:quilt-loader:${quiltLoaderVersion}@json")).singleFile
+		def meta = new groovy.json.JsonSlurper().parse(json)
+		def libraries = (meta.libraries.common + meta.libraries[side]).collect { dependencies.create(it.name) }
+		configurations.detachedConfiguration(dependencies.create("org.quiltmc:quilt-loader:${quiltLoaderVersion}"), *libraries)
+			.tap { transitive = false }
+			.files
+	})
+}
+def addModsArg = { "-Dloader.addMods=" + prodMods.files*.absolutePath.join(File.pathSeparator) }
+
+// A restart must restore the loaders a previous run left. DimensionCases leaves a size-1 table in the Nether and the
+// End (nothing else puts tables there), so a run on an existing world must log a restore in both.
+def checkRestored = { File runDirectory, boolean worldExisted ->
+	if (!worldExisted) {
+		logger.lifecycle("New world in ${runDirectory.name}: run the server again to check the restart restore")
+		return
+	}
+	def log = new File(runDirectory, "logs/latest.log")
+	if (!log.isFile()) {
+		throw new GradleException("No server log at ${log}: can't check the restart restore")
+	}
+	def text = log.getText("UTF-8")
+	["minecraft:the_nether", "minecraft:the_end"].each { dimension ->
+		def restored = (text =~ /Restored (\d+) crafting table loader\(s\) in ${java.util.regex.Pattern.quote(dimension)}/)
+		if (!restored.find() || (restored.group(1) as int) < 1) {
+			throw new GradleException("Restart restore failed: ${log} has no 'Restored N>=1 crafting table loader(s) in ${dimension}'")
+		}
+	}
+	logger.lifecycle("Restart restore OK in ${runDirectory.name}: the Nether and the End restored their loaders")
+}
+
+// Quilt Loader provides an older fabricloader than Fabric's own (0.30.1 provides 0.19.3). fabric.mod.json's floor must
+// be at or below every pinned Quilt's, or stable Quilt refuses the jar (gotchas.md 2026-09-29); it must also be at or
+// below loader_version, which the Fabric build runs on.
+repositories {
+	exclusiveContent {
+		forRepository {
+			maven {
+				name = "Quilt"
+				url = "https://maven.quiltmc.org/repository/release/"
+			}
+		}
+		filter { includeGroup "org.quiltmc" }
+	}
+}
+def checkQuiltFloor = tasks.register("checkQuiltFloor") {
+	group = "verification"
+	description = "Fails if fabric.mod.json's fabricloader floor is above what any pinned Quilt Loader provides, or above loader_version."
+	def modJson = file("src/main/resources/fabric.mod.json")
+	def loaderVersion = project.loader_version.toString()
+	def quiltJars = quiltPins.values().toList().unique().collectEntries { v ->
+		[(v): configurations.detachedConfiguration(dependencies.create("org.quiltmc:quilt-loader:${v}")).tap { transitive = false }]
+	}
+	inputs.file(modJson)
+	inputs.property("loaderVersion", loaderVersion)
+	quiltJars.values().each { inputs.files(it) }
+	doLast {
+		def declared = new groovy.json.JsonSlurper().parse(modJson).depends.fabricloader.toString()
+		def match = declared =~ /^>=(\d+(?:\.\d+)*)$/
+		if (!match.matches()) {
+			throw new GradleException("fabric.mod.json's fabricloader must be a plain '>=x.y.z' floor for this check, got '${declared}'")
+		}
+		def floor = match.group(1)
+		if (compareVersions(floor, loaderVersion) > 0) {
+			throw new GradleException("fabricloader floor ${floor} is above loader_version ${loaderVersion}")
+		}
+		if (quiltJars.isEmpty()) {
+			logger.lifecycle("No quilt_loader.<mc> pins: fabricloader floor ${floor} is not checked against Quilt")
+		}
+		quiltJars.each { version, configuration ->
+			def quiltMod = new java.util.zip.ZipFile(configuration.singleFile).withCloseable { zip ->
+				new groovy.json.JsonSlurper().parse(zip.getInputStream(zip.getEntry("quilt.mod.json")))
+			}
+			def provided = quiltMod.quilt_loader.provides.find { it instanceof Map && it.id == "fabricloader" }?.version
+			if (!provided) {
+				throw new GradleException("Quilt Loader ${version} doesn't declare the fabricloader version it provides; can't check the floor")
+			}
+			if (compareVersions(floor, provided.toString()) > 0) {
+				throw new GradleException("fabricloader floor ${floor} is above ${provided}, which Quilt Loader ${version} provides: stable Quilt would refuse the jar")
+			}
+			logger.lifecycle("fabricloader floor ${floor} <= ${provided} (Quilt Loader ${version}) and <= ${loaderVersion} (loader_version)")
+		}
+	}
+}
+tasks.named("check") {
+	dependsOn checkQuiltFloor
+}
+
+if (isQuilt) {
+	def quiltServerDir = layout.buildDirectory.dir("run/prodServerGameTest/${prodRunLeaf}")
+	// The real Quilt server install: the installer fetches the vanilla server and Quilt's libraries.
+	def installQuiltServer = tasks.register("installQuiltServer", JavaExec) {
+		group = "verification"
+		description = "Installs a Quilt Loader server for -Pminecraft_version into the Quilt prod server run dir."
+		classpath = configurations.detachedConfiguration(dependencies.create("org.quiltmc:quilt-installer:${project.quilt_installer_version}")).tap { transitive = false }
+		mainClass = "org.quiltmc.installer.Main"
+		javaLauncher = prodLauncher
+		def minecraftVersion = project.minecraft_version
+		inputs.property("minecraft", minecraftVersion)
+		inputs.property("quiltLoader", quiltLoaderVersion)
+		outputs.file(quiltServerDir.map { it.file("quilt-server-launch.jar") })
+		doFirst {
+			def dir = quiltServerDir.get().asFile
+			dir.mkdirs()
+			args("install", "server", minecraftVersion, quiltLoaderVersion, "--download-server", "--install-dir=${dir.absolutePath}")
+		}
+	}
+
+	tasks.register("prodServerGameTest", Exec) {
+		group = "verification"
+		description = "Runs the server gametests from prebuilt jars on a production Quilt server."
+		dependsOn installQuiltServer
+		inputs.files(prodMods)
+		boolean worldExisted = false
+		doFirst {
+			checkProdMods(prodMods.files)
+			def dir = quiltServerDir.get().asFile
+			worldExisted = new File(dir, "world/level.dat").isFile()
+			new File(dir, "eula.txt").text = "eula=true\n"
+			workingDir dir
+			executable prodLauncher.get().executablePath.asFile.absolutePath
+			args(addModsArg(), "-Dfabric-api.gametest", "-jar", "quilt-server-launch.jar", "nogui")
+			logger.lifecycle("Quilt Loader ${quiltLoaderVersion} server in ${dir}")
+		}
+		doLast { checkRestored(quiltServerDir.get().asFile, worldExisted) }
+	}
+
+	tasks.register("prodClientGameTest", ClientProductionRunTask) {
+		group = "verification"
+		description = "Runs the client gametest from prebuilt jars on a production Quilt client."
+		outputs.upToDateWhen { false }
+		mods.setFrom(prodMods)
+		javaLauncher = prodLauncher
+		jvmArgs.add("-Dfabric.client.gametest")
+		jvmArgs.add(provider(addModsArg))
+		programArgs.addAll("--username", "Player0")
+		runDir = layout.buildDirectory.dir("run/prodClientGameTest/${prodRunLeaf}")
+		// Loom's classpath is the client jar, Fabric Loader with its installer libraries, and Minecraft's libraries.
+		// Swap the loader part for Quilt Loader and its libraries.
+		def fabricLoaderJars = ~/^(fabric-loader|asm|asm-analysis|asm-commons|asm-tree|asm-util|sponge-mixin|mixinextras-fabric)-\d.*\.jar$/
+		def loomClasspath = files(classpath.from.toList())
+		classpath.setFrom(loomClasspath.filter { !(it.name ==~ fabricLoaderJars) }, quiltLibraries("client"))
+		mainClass = "org.quiltmc.loader.impl.launch.knot.KnotClient"
+		doFirst {
+			checkProdMods(mods.files)
+			// Fails closed: the filter must have dropped exactly Fabric Loader's own set (Quilt re-adds the same ASM jars),
+			// and no Fabric Loader jar may be left.
+			def removed = loomClasspath.files*.name.findAll { it ==~ fabricLoaderJars }.sort()
+			def loaderJars = removed.findAll { it.startsWith("fabric-loader-") }
+			if (loaderJars.size() != 1 || removed.size() != 8) {
+				throw new GradleException("Expected to swap out Fabric Loader and its 7 libraries, removed ${removed}")
+			}
+			def left = classpath.files*.name.findAll { it.startsWith("fabric-loader") }
+			if (left) {
+				throw new GradleException("Fabric Loader is still on the Quilt client classpath: ${left}")
+			}
+			logger.lifecycle("Quilt Loader ${quiltLoaderVersion} client")
+		}
+	}
+} else {
+	tasks.register("prodServerGameTest", ServerProductionRunTask) {
+		group = "verification"
+		description = "Runs the server gametests from prebuilt jars on a production Fabric server."
+		// Loom lets this task be UP-TO-DATE, which silently skips the tests (and the restart restore) on a rerun.
+		outputs.upToDateWhen { false }
+		mods.setFrom(prodMods)
+		javaLauncher = prodLauncher
+		jvmArgs.add("-Dfabric-api.gametest")
+		// One run directory per version: an older server can't read a world a newer one saved.
+		def runDirectory = layout.buildDirectory.dir("run/prodServerGameTest/${prodRunLeaf}")
+		runDir = runDirectory
+		boolean worldExisted = false
+		doFirst {
+			checkProdMods(mods.files)
+			def dir = runDirectory.get().asFile
+			dir.mkdirs()
+			if (worldToImport) {
+				copyWorld(rootProject.file(worldToImport), new File(dir, "world"))
+			}
+			worldExisted = new File(dir, "world/level.dat").isFile()
+			new File(dir, "eula.txt").text = "eula=true\n"
+		}
+		doLast { checkRestored(runDirectory.get().asFile, worldExisted) }
+	}
+
+	tasks.register("prodClientGameTest", ClientProductionRunTask) {
+		group = "verification"
+		description = "Runs the client gametest from prebuilt jars on a production Fabric client."
+		outputs.upToDateWhen { false }
+		mods.setFrom(prodMods)
+		javaLauncher = prodLauncher
+		jvmArgs.add("-Dfabric.client.gametest")
+		programArgs.addAll("--username", "Player0")
+		runDir = layout.buildDirectory.dir("run/prodClientGameTest/${prodRunLeaf}")
+		doFirst { checkProdMods(mods.files) }
+	}
+}
+
+java {
+	withSourcesJar()
+}

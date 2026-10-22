@@ -1,0 +1,583 @@
+// The production harness shared by the loaders that install a real server and client with their own installer (NeoForge,
+// Forge; TODO 14.1). Apply it, then call loaderHarness(spec) once:
+//   loader         the loader's name as the jar classifier and task names use it: "NeoForge"
+//   minecraft      the Minecraft version this build runs
+//   loaderVersion  the loader build pinned for it
+//   installer      the installer's Maven coordinates
+//   installArgs    { String side, File dir -> [...] }: the installer's headless args for side "server" or "client"
+//   serverLaunch   the installed server's args file, relative to the server dir
+//   clientVersion  the installed client's version id, under versions/
+//   metadata       the jar entries only this loader's build writes: checkReleaseJarBytes ignores them
+//   gametestJar    the gametest mod's Jar task
+//   guestRefusal   optional: a regex for the server line that refuses a vanilla client before it has a name (Forge's
+//                  handshake); a refusal that names the player is always caught
+// It registers the report check, the installers, prodServerRestore, prodClientSmoke, prodVanillaGuest, and
+// checkReleaseJarBytes, and returns what the loader's own prodServerGameTest needs. Fabric and Quilt run through Loom's
+// production tasks instead (fabric/build.gradle).
+
+apply from: rootProject.file('gradle/worlds.gradle')
+apply from: rootProject.file('gradle/release.gradle')
+
+def loaderHarness = { Map spec ->
+	String loader = spec.loader
+	String minecraft = spec.minecraft
+	String loaderVersion = spec.loaderVersion
+	String launchPath = spec.serverLaunch
+	String clientVersion = spec.clientVersion
+	def common = project(':common')
+
+	// The CTCL test ids, from the instance JSON the gametest jar ships: <group>/<name>.json -> ctcl_gametest:<group>/<name>.
+	def instanceDir = common.file('src/gametest/resources/data/ctcl_gametest/test_instance')
+	def expectedTests = { ->
+		fileTree(instanceDir) { include "**/*.json" }.files.collect { file ->
+			"ctcl_gametest:" + instanceDir.toPath().relativize(file.toPath()).toString().replace(File.separator, "/").replaceAll(/\.json$/, "")
+		}.sort()
+	}
+
+	// Fails unless vanilla's JUnit-style report shows every CTCL test passed, and no other CTCL test ran. The exit code
+	// alone can't show a case was skipped, and a passing run logs no test names.
+	def checkGameTestReport = { File report ->
+		if (!report.isFile()) {
+			throw new GradleException("No gametest report at ${report}: the server didn't finish its tests")
+		}
+		def cases = new groovy.xml.XmlSlurper().parse(report).'**'.findAll { it.name() == "testcase" }
+		def ours = cases.findAll { it.@name.toString().startsWith("ctcl_gametest:") }
+		def failed = ours.findAll { it.children().any { child -> child.name() in ["failure", "error"] } }*.@name*.toString().sort()
+		def ran = ours*.@name*.toString().sort()
+		def expected = expectedTests()
+		if (failed) {
+			throw new GradleException("CTCL gametests failed: ${failed} (report: ${report})")
+		}
+		if (ran != expected) {
+			throw new GradleException("CTCL gametests that ran don't match the cases. Missing: ${expected - ran}. Unexpected: ${ran - expected}. Report: ${report}")
+		}
+		logger.lifecycle("All ${ran.size()} CTCL gametests passed (${report})")
+	}
+
+	// Re-checks any saved report: ./gradlew :<loader project>:checkGameTestReport -Pctcl_report=<report.xml>
+	tasks.register("checkGameTestReport") {
+		group = "verification"
+		description = "Fails unless the gametest report in -Pctcl_report shows every CTCL case passed."
+		def reportPath = project.findProperty("ctcl_report")
+		doLast {
+			if (!reportPath) {
+				throw new GradleException("checkGameTestReport needs -Pctcl_report=<report.xml>")
+			}
+			// Relative to the repo root, where the command runs.
+			checkGameTestReport(rootProject.file(reportPath))
+		}
+	}
+
+	// With -Pctcl_prod_mods=<dir> (holding the release jar and its gametest jar, both built on the base), the harness
+	// proves the shipped bytes run on each pin; checkReleaseJarBytes proves they're what that pin compiles. Without the
+	// property, this build's own jars are used. From a directory, only the jars whose names list this loader
+	// (gradle/release.gradle), so it may hold every loader's jars, and a merged ctcl-<v>+<label>-Forge-NeoForge.jar
+	// serves both.
+	def prodModsDir = project.findProperty("ctcl_prod_mods")
+	def prodJars = prodModsDir ? fileTree(prodModsDir) { include "*.jar" }.filter { loader in jarLoaders(it.name) } : files(tasks.named("jar"), spec.gametestJar)
+	def prodLauncher = javaToolchains.launcherFor { languageVersion = JavaLanguageVersion.of(25) }
+	// A run dir per version and per jar source: FML reads mods only from <gameDir>/mods, and this harness never deletes a jar.
+	def runLeaf = "${minecraft}${prodModsDir ? '-release' : ''}"
+	def prodServerDir = layout.buildDirectory.dir("run/prodServerGameTest/${runLeaf}")
+	// A named configuration, so a loader's build can point a repository away from it (forge/build.gradle).
+	def installerJar = configurations.create("prodInstaller") {
+		canBeConsumed = false
+		transitive = false
+	}
+	dependencies.add("prodInstaller", spec.installer)
+
+	// Exactly one release jar and one gametest jar, or the run could test the wrong bytes.
+	def pickProdJars = { ->
+		def jars = prodJars.files
+		def gametest = jars.findAll { jarLoaders(it.name).last() == "gametest" }
+		def release = jars - gametest
+		if (release.size() != 1 || gametest.size() != 1) {
+			throw new GradleException("The ${loader} production run needs exactly one release jar and one gametest jar whose names list ${loader}, found ${jars*.name} in ${prodModsDir ?: 'build/libs'}")
+		}
+		[release.first(), gametest.first()]
+	}
+
+	// Copies the jars into <dir>/mods, replacing earlier copies of the same names. Any other jar there fails the run
+	// rather than being deleted: FML would load it too.
+	def stageMods = { File dir, List<File> jars ->
+		def mods = new File(dir, "mods")
+		mods.mkdirs()
+		def foreign = (mods.listFiles()?.toList() ?: []).findAll { it.name.endsWith(".jar") && !(it.name in jars*.name) }
+		if (foreign) {
+			throw new GradleException("${mods} holds other jars FML would also load: ${foreign*.name}. Remove them, or run ./gradlew :${project.name}:clean")
+		}
+		jars.each { java.nio.file.Files.copy(it.toPath(), new File(mods, it.name).toPath(), java.nio.file.StandardCopyOption.REPLACE_EXISTING) }
+		logger.lifecycle("${loader} ${loaderVersion} mods in ${mods}: ${jars*.name}")
+	}
+
+	// Starts a process in dir. Each console line goes to the console file, to this build's output, and to onLine(line,
+	// process), which may type into the process. Returns [process, reader thread] for awaitExit.
+	def startProcess = { File dir, List<String> command, File console, Closure onLine ->
+		logger.lifecycle("Starting ${command.findAll { it.length() < 200 }.join(' ')} in ${dir}")
+		def process = new ProcessBuilder(command).directory(dir).redirectErrorStream(true).start()
+		def reader = Thread.start {
+			console.withWriter("UTF-8") { writer ->
+				try {
+					process.inputStream.newReader("UTF-8").eachLine { line ->
+						writer.writeLine(line)
+						println line
+						onLine(line, process)
+					}
+				} catch (IOException e) {
+					// A process killed from onLine (startClient) can close its stream under the reader. Anything else is a real error.
+					if (process.alive) {
+						throw e
+					}
+					logger.lifecycle("Stopped reading ${console.name}: process ${process.pid()} was killed (${e.message})")
+				}
+			}
+		}
+		[process, reader]
+	}
+
+	// Thread dumps of a live JVM, appended to dumpFile: `count` jstack -l runs, `gap` apart, with the toolchain's own
+	// jstack. Two dumps tell a deadlock (same stacks) from a busy loop. A failed jstack is logged, never fatal: the caller
+	// is about to kill the process either way.
+	def jstackPath = prodLauncher.map { it.metadata.installationPath.file("bin/jstack" + (org.gradle.internal.os.OperatingSystem.current().windows ? ".exe" : "")).asFile }
+	// jstackFile defaults to the toolchain's, which only resolves on a Gradle build thread: a caller on another thread
+	// passes the File it resolved earlier.
+	def dumpThreads = { Process process, File dumpFile, int count, java.time.Duration gap, File jstackFile = jstackPath.get() ->
+		(1..count).each { int n ->
+			if (!process.alive) {
+				logger.warn("No thread dump ${n} of ${count}: process ${process.pid()} already exited")
+				return
+			}
+			def jstack = new ProcessBuilder([jstackFile.absolutePath, "-l", process.pid().toString()]).redirectErrorStream(true).start()
+			def out = jstack.inputStream.getText("UTF-8")
+			if (!jstack.waitFor(1, java.util.concurrent.TimeUnit.MINUTES) || jstack.exitValue() != 0) {
+				logger.warn("jstack on ${process.pid()} failed (dump ${n} of ${count}): ${out.take(500)}")
+			}
+			dumpFile << "==== jstack -l ${process.pid()}, dump ${n} of ${count}, ${java.time.Instant.now()}\n${out}\n"
+			if (n < count) {
+				Thread.sleep(gap.toMillis())
+			}
+		}
+		logger.lifecycle("Thread dumps of the hung process: ${dumpFile}")
+	}
+
+	// Waits for a started process to exit and returns its exit code. After the timeout it dumps the threads to
+	// <console>-threads.txt (next to the console, so the CI failure artifact gets it), kills the process (only this
+	// one, the one startProcess made), and fails.
+	def awaitExitWithin = { List started, java.time.Duration timeout, String what, File console, java.time.Duration dumpGap ->
+		Process process = started[0]
+		Thread reader = started[1]
+		if (!process.waitFor(timeout.toMillis(), java.util.concurrent.TimeUnit.MILLISECONDS)) {
+			def dumpFile = new File(console.parentFile, console.name.replaceFirst(/\.log$/, "") + "-threads.txt")
+			dumpThreads(process, dumpFile, 2, dumpGap)
+			process.destroyForcibly()
+			process.waitFor(1, java.util.concurrent.TimeUnit.MINUTES)
+			reader.join(10_000)
+			throw new GradleException("${what} didn't exit within ${timeout.toMinutes() ?: timeout.seconds + 's'}${timeout.toMinutes() ? ' minutes' : ''}; killed it. Console: ${console}. Thread dumps: ${dumpFile}")
+		}
+		reader.join(10_000)
+		process.exitValue()
+	}
+	def awaitExit = { List started, int minutes, String what, File console ->
+		awaitExitWithin(started, java.time.Duration.ofMinutes(minutes), what, console, java.time.Duration.ofSeconds(10))
+	}
+
+	// Self-test of the hang path: a JVM that sleeps past a 3 s timeout must be killed, and the failure must come with a
+	// thread dump that shows it. Without this, a refactor could drop the dump and only the next real hang would notice.
+	def checkHangDump = tasks.register("checkHangDump") {
+		group = "verification"
+		description = "Proves the harness takes thread dumps of a process that outlives its timeout before killing it."
+		def work = layout.buildDirectory.dir("tmp/checkHangDump")
+		doLast {
+			def dir = work.get().asFile
+			project.delete(dir)
+			dir.mkdirs()
+			new File(dir, "CtclHang.java").text = "class CtclHang { public static void main(String[] a) throws Exception { System.out.println(\"sleeping\"); Thread.sleep(600_000); } }\n"
+			def console = new File(dir, "hang-console.log")
+			def started = startProcess(dir, [prodLauncher.get().executablePath.asFile.absolutePath, "CtclHang.java"], console) { String line, Process p -> }
+			def failure = null
+			try {
+				awaitExitWithin(started, java.time.Duration.ofSeconds(3), "The hang self-test JVM", console, java.time.Duration.ofSeconds(1))
+			} catch (GradleException e) {
+				failure = e
+			}
+			Process process = started[0]
+			if (failure == null) {
+				throw new GradleException("checkHangDump: awaitExit returned for a process that should have hung")
+			}
+			if (process.alive) {
+				process.destroyForcibly()
+				throw new GradleException("checkHangDump: the hung process ${process.pid()} is still alive after the timeout")
+			}
+			def dumps = new File(dir, "hang-console-threads.txt")
+			def text = dumps.exists() ? dumps.getText("UTF-8") : ""
+			if ((text =~ /dump \d of 2/).size() != 2 || !text.contains("CtclHang.main") || !failure.message.contains(dumps.name)) {
+				throw new GradleException("checkHangDump: expected 2 dumps showing CtclHang.main in ${dumps} and its path in the failure, got: ${failure.message}")
+			}
+			logger.lifecycle("checkHangDump OK: the hung JVM was dumped twice, then killed (${dumps})")
+		}
+	}
+	tasks.named("check") { dependsOn checkHangDump }
+
+	// Starts a client the harness never types into. A client whose main thread died is finished, but a non-daemon thread
+	// can keep its JVM alive: Forge's early-window crash prompt waits on a console y/n (gotchas.md 2026-10-01). So on
+	// `Exception in thread "main"` it dumps the threads to <console>-threads.txt and kills the client at once, instead of
+	// waiting for the watchdog. Returns [process, reader thread, died flag]; awaitExit takes it as is.
+	def startClient = { File dir, List<String> command, File console ->
+		def died = new java.util.concurrent.atomic.AtomicBoolean()
+		// Resolved here, on the task's thread: the console reader below can't resolve a toolchain provider.
+		File jstackFile = jstackPath.get()
+		def dumpFile = new File(console.parentFile, console.name.replaceFirst(/\.log$/, "") + "-threads.txt")
+		def started = startProcess(dir, command, console) { String line, Process process ->
+			// Anywhere in the line: Forge's `y/n: ` prompt has no newline, so the exception follows it on the same line.
+			if (line.contains('Exception in thread "main"') && died.compareAndSet(false, true)) {
+				logger.warn("The client's main thread died (${console}); dumping its threads to ${dumpFile} and killing it")
+				try {
+					dumpThreads(process, dumpFile, 1, java.time.Duration.ZERO, jstackFile)
+				} catch (Exception e) {
+					logger.error("The thread dump of the dead client ${process.pid()} failed; killing it anyway", e)
+				}
+				process.destroyForcibly()
+			}
+		}
+		started + [died]
+	}
+
+	// The one client death the smoke test retries (owner answer 43): Forge's early window gives glfwCreateWindow 10 s, and a
+	// cold Mesa GL init on Xvfb can overrun it. Any other death fails at once.
+	def earlyWindowTimedOut = { File console ->
+		console.isFile() && console.getText("UTF-8").contains("Timed out trying to setup the Game Window")
+	}
+
+	// Self-test of startClient and the retry rule. A JVM whose main thread throws while a non-daemon thread sleeps must be
+	// killed long before its 2-minute timeout, with died set and a dump that shows the sleeper. Like Forge, it prints `y/n: `
+	// with no newline first, so the exception lands mid-line.
+	def checkClientDeathKill = tasks.register("checkClientDeathKill") {
+		group = "verification"
+		description = "Proves the harness kills a client whose main thread died, and retries only Forge's early-window timeout."
+		def work = layout.buildDirectory.dir("tmp/checkClientDeathKill")
+		doLast {
+			def dir = work.get().asFile
+			project.delete(dir)
+			dir.mkdirs()
+			new File(dir, "CtclDeadMain.java").text = "class CtclDeadMain { public static void main(String[] a) { Thread t = new Thread(() -> { try { Thread.sleep(600_000); } catch (InterruptedException e) { } }, \"ctcl-sleeper\"); t.start(); System.out.print(\"y/n: \"); System.out.flush(); throw new IllegalStateException(\"main died\"); } }\n"
+			def console = new File(dir, "dead-console.log")
+			long start = System.nanoTime()
+			def started = startClient(dir, [prodLauncher.get().executablePath.asFile.absolutePath, "CtclDeadMain.java"], console)
+			def failure = null
+			try {
+				awaitExitWithin(started, java.time.Duration.ofMinutes(2), "The dead-main self-test JVM", console, java.time.Duration.ofSeconds(1))
+			} catch (GradleException e) {
+				failure = e
+			}
+			long seconds = java.time.Duration.ofNanos(System.nanoTime() - start).seconds
+			Process process = started[0]
+			if (process.alive) {
+				process.destroyForcibly()
+				throw new GradleException("checkClientDeathKill: process ${process.pid()} is still alive")
+			}
+			def dumps = new File(dir, "dead-console-threads.txt")
+			def text = dumps.exists() ? dumps.getText("UTF-8") : ""
+			if (failure != null || seconds >= 30 || !started[2].get() || !text.contains("ctcl-sleeper")) {
+				throw new GradleException("checkClientDeathKill: expected a kill within 30 s with died set and ctcl-sleeper in ${dumps}; " +
+					"got ${seconds} s, died=${started[2].get()}, failure=${failure?.message}")
+			}
+			def cases = [
+				"Failed to initialize graphics window with current settings.\nTimed out trying to setup the Game Window.\n": true,
+				"Exception in thread \"main\" java.lang.IllegalStateException: something else\n": false,
+				"[Render thread/INFO]: Stopping!\n": false,
+			]
+			cases.each { String consoleText, boolean retry ->
+				def fake = new File(dir, "fake-console.log")
+				fake.setText(consoleText, "UTF-8")
+				if (earlyWindowTimedOut(fake) != retry) {
+					throw new GradleException("checkClientDeathKill: earlyWindowTimedOut should be ${retry} for: ${consoleText.trim()}")
+				}
+			}
+			if (earlyWindowTimedOut(new File(dir, "missing-console.log"))) {
+				throw new GradleException("checkClientDeathKill: a missing console must not retry")
+			}
+			logger.lifecycle("checkClientDeathKill OK: the dead-main JVM was dumped and killed in ${seconds} s; the retry rule holds")
+		}
+	}
+	tasks.named("check") { dependsOn checkClientDeathKill }
+
+	def typeLine = { Process process, String text ->
+		process.outputStream.write((text + "\n").getBytes("UTF-8"))
+		process.outputStream.flush()
+	}
+
+	// jvmArgs go before the args files, so they come before the main class inside them.
+	def serverCommand = { String argsFile, List<String> gameArgs, List<String> jvmArgs = [] ->
+		[prodLauncher.get().executablePath.asFile.absolutePath] + jvmArgs + ["@user_jvm_args.txt", "@${argsFile}".toString()] + gameArgs
+	}
+
+	// Runs the installed server with an args file and waits for it to exit. With stopWhenDone, it types `stop` once the
+	// server logs Done. The console goes to <server>/<consoleName>.
+	def runServer = { File serverDir, String argsFile, List<String> gameArgs, String consoleName, boolean stopWhenDone, List<String> jvmArgs = [] ->
+		def console = new File(serverDir, consoleName)
+		boolean stopped = false
+		def started = startProcess(serverDir, serverCommand(argsFile, gameArgs, jvmArgs), console) { String line, Process process ->
+			if (stopWhenDone && !stopped && line =~ /Done \(\d/) {
+				typeLine(process, "stop")
+				stopped = true
+			}
+		}
+		awaitExit(started, 15, "The ${loader} server in ${serverDir}", console)
+	}
+
+	// A restart must restore the loaders a previous run left. DimensionCases leaves a size-1 table in the Nether and the
+	// End (nothing else puts tables there), so a boot on that world must log a restore in both. Same rule as fabric/.
+	def checkRestored = { File console ->
+		def text = console.getText("UTF-8")
+		["minecraft:the_nether", "minecraft:the_end"].each { dimension ->
+			def restored = (text =~ /Restored (\d+) crafting table loader\(s\) in ${java.util.regex.Pattern.quote(dimension)}/)
+			if (!restored.find() || (restored.group(1) as int) < 1) {
+				throw new GradleException("Restart restore failed: ${console} has no 'Restored N>=1 crafting table loader(s) in ${dimension}'")
+			}
+		}
+		logger.lifecycle("Restart restore OK: the Nether and the End restored their loaders (${console})")
+	}
+
+	// A real install, from the loader's own installer: a server, or a client in a launcher dir (the installer wants the
+	// launcher's profile file there). The installer writes its log next to its own jar, so it runs from a copy in the
+	// install dir rather than from Gradle's cache.
+	def registerInstall = { String name, Provider<Directory> installDir, String side ->
+		tasks.register(name, JavaExec) {
+			group = "verification"
+			description = "Installs a ${loader} ${side} for -Pminecraft_version with ${loader}'s own installer."
+			javaLauncher = prodLauncher
+			// Both installers keep Forge's class name.
+			mainClass = "net.minecraftforge.installer.SimpleInstaller"
+			inputs.property(loader.toLowerCase(), loaderVersion)
+			outputs.file(installDir.map { side == "server" ? it.file(launchPath) : it.file("versions/${clientVersion}/${clientVersion}.json") })
+			def copy = installDir.map { it.file("${loader.toLowerCase()}-${loaderVersion}-installer.jar") }
+			classpath = files(copy)
+			doFirst {
+				def dir = installDir.get().asFile
+				dir.mkdirs()
+				java.nio.file.Files.copy(installerJar.singleFile.toPath(), copy.get().asFile.toPath(), java.nio.file.StandardCopyOption.REPLACE_EXISTING)
+				def profiles = new File(dir, "launcher_profiles.json")
+				if (side == "client" && !profiles.exists()) {
+					profiles.text = '{"profiles":{}}\n'
+				}
+				workingDir dir
+				args(spec.installArgs(side, dir))
+			}
+		}
+	}
+	def installServer = registerInstall("install${loader}Server", prodServerDir, "server")
+
+	// Cross-loader world move (TODO 13.6): the release jar alone, in a real server, booted on a copy of a world another
+	// install saved (-Pctcl_world=<world dir>, e.g. the Fabric production server's). It must restore the loaders that
+	// world holds in the Nether and the End. The copy is left in place, and its path is logged for the move back.
+	def worldToImport = project.findProperty("ctcl_world")
+	// A plain server: the release jar alone in mods/, as a player would run it. The world move and the vanilla guest use it.
+	def plainServerDir = layout.buildDirectory.dir("run/prodServer/${runLeaf}")
+	def installPlainServer = registerInstall("install${loader}PlainServer", plainServerDir, "server")
+
+	tasks.register("prodServerRestore") {
+		group = "verification"
+		description = "Boots the release jar in a real ${loader} server on a copy of the world in -Pctcl_world and checks the restore."
+		dependsOn installPlainServer
+		inputs.files(prodJars)
+		outputs.upToDateWhen { false }
+		doLast {
+			if (!worldToImport) {
+				throw new GradleException("prodServerRestore needs -Pctcl_world=<a world dir another install saved>")
+			}
+			def dir = plainServerDir.get().asFile
+			stageMods(dir, [pickProdJars()[0]])
+			new File(dir, "eula.txt").text = "eula=true\n"
+			def universe = new File(dir, "imported")
+			def worldName = importStamp()
+			universe.mkdirs()
+			copyWorld(rootProject.file(worldToImport), new File(universe, worldName))
+			int exit = runServer(dir, launchPath, ["--universe", universe.absolutePath, "--world", worldName, "nogui"], "restore-console.log", true)
+			if (exit != 0) {
+				throw new GradleException("The ${loader} server on the imported world exited with ${exit}. Console: ${new File(dir, 'restore-console.log')}")
+			}
+			checkRestored(new File(dir, "restore-console.log"))
+			logger.lifecycle("${loader} saved the imported world at ${new File(universe, worldName)}")
+		}
+	}
+
+	// Clients (TODO 13.7). The installers can only put a client in a launcher dir, so tools/mclaunch.py does the
+	// launcher's part: libraries, assets, and the command. This build starts the command itself, so it owns the process.
+	// The same install serves the vanilla guest, because the installer also brings the vanilla version.
+	def clientDir = layout.buildDirectory.dir("run/prodClient/${runLeaf}")
+	def installClient = registerInstall("install${loader}Client", clientDir, "client")
+	def python = (project.findProperty("ctcl_python") ?: "python").toString()
+	// Shared by every run and version: the objects are content-addressed, and mclaunch checks each one's sha1.
+	def assetsDir = new File(gradle.gradleUserHomeDir, "caches/ctcl-mclaunch/assets")
+
+	// Prepares a client with mclaunch and returns its java command.
+	def prepareClient = { File root, String versionId, File gameDir, String username, List<String> jvmArgs, String quickPlay ->
+		def out = new File(gameDir, "command.json")
+		def command = [python, rootProject.file("tools/mclaunch.py").absolutePath, "--root", root.absolutePath, "--version", versionId,
+			"--game-dir", gameDir.absolutePath, "--assets", assetsDir.absolutePath, "--java", prodLauncher.get().executablePath.asFile.absolutePath,
+			"--username", username, "--out", out.absolutePath]
+		// The = form: argparse would read a bare "-D..." as an option of its own.
+		jvmArgs.each { command << "--jvm-arg=${it}".toString() }
+		if (quickPlay) {
+			command += ["--quick-play-multiplayer", quickPlay]
+		}
+		def process = new ProcessBuilder(command).redirectErrorStream(true).start()
+		process.inputStream.newReader("UTF-8").eachLine { println it }
+		int exit = process.waitFor()
+		if (exit != 0) {
+			throw new GradleException("tools/mclaunch.py couldn't prepare ${versionId} (exit ${exit}); see its output above")
+		}
+		new groovy.json.JsonSlurper().parse(out).command.collect { it.toString() }
+	}
+
+	tasks.register("prodClientSmoke") {
+		group = "verification"
+		description = "Runs the CTCL client smoke test from prebuilt jars in a real ${loader} client."
+		dependsOn installClient
+		inputs.files(prodJars)
+		outputs.upToDateWhen { false }
+		doLast {
+			def root = clientDir.get().asFile
+			def gameDir = new File(root, "game-smoke")
+			gameDir.mkdirs()
+			stageMods(gameDir, pickProdJars())
+			def result = new File(gameDir, "ctcl-client-smoke.txt")
+			// A result from an earlier run must never pass this one.
+			result.delete()
+			def command = prepareClient(root, clientVersion, gameDir, "CtclSmoke", ["-Dctcl.clientSmoke=${result.absolutePath}"], null)
+			def console = new File(gameDir, "smoke-console.log")
+			// Like the result: a dump from an earlier run must never be read as this run's (dumpThreads appends).
+			new File(gameDir, "smoke-console-threads.txt").delete()
+			def started = startClient(gameDir, command, console)
+			int exit = awaitExit(started, 15, "The ${loader} client", console)
+			if (started[2].get() && earlyWindowTimedOut(console)) {
+				// The first try's console and dump are kept next to the retry's, so the CI artifact has both.
+				def firstConsole = new File(gameDir, "smoke-console-try1.log")
+				java.nio.file.Files.move(console.toPath(), firstConsole.toPath(), java.nio.file.StandardCopyOption.REPLACE_EXISTING)
+				def firstDump = new File(gameDir, "smoke-console-threads.txt")
+				if (firstDump.exists()) {
+					java.nio.file.Files.move(firstDump.toPath(), new File(gameDir, "smoke-console-try1-threads.txt").toPath(), java.nio.file.StandardCopyOption.REPLACE_EXISTING)
+				}
+				logger.warn("${loader}'s early window timed out on its first try (${firstConsole}); running the client once more (owner answer 43)")
+				result.delete()
+				started = startClient(gameDir, command, console)
+				exit = awaitExit(started, 15, "The ${loader} client", console)
+			}
+			if (started[2].get()) {
+				throw new GradleException("The ${loader} client's main thread died (exit ${exit}). Console: ${console}. Thread dump: ${new File(gameDir, 'smoke-console-threads.txt')}")
+			}
+			def outcome = result.isFile() ? result.getText("UTF-8").trim() : "no result: the client crashed or never reached the test (exit ${exit})"
+			if (!outcome.startsWith("PASS")) {
+				throw new GradleException("${loader} client smoke test: ${outcome}. Console: ${console}")
+			}
+			logger.lifecycle("${loader} client smoke test on ${loaderVersion}: ${outcome}")
+		}
+	}
+
+	// The LAN guest rule: a client without the mod can join a host running it. A real vanilla client joins the plain
+	// server (the release jar alone) through quick play; it passes once the server logs the join. The dedicated server
+	// negotiates payloads the same way an integrated LAN host does.
+	tasks.register("prodVanillaGuest") {
+		group = "verification"
+		description = "Checks a vanilla client can join a real ${loader} server running the release jar."
+		dependsOn installPlainServer, installClient
+		inputs.files(prodJars)
+		outputs.upToDateWhen { false }
+		doLast {
+			def serverDir = plainServerDir.get().asFile
+			stageMods(serverDir, [pickProdJars()[0]])
+			new File(serverDir, "eula.txt").text = "eula=true\n"
+			int port = new ServerSocket(0).withCloseable { it.localPort }
+			// A fresh file each run: vanilla fills in every other setting. From 26.3 a new server defaults to white-list=true,
+			// which turns the guest away before CTCL is involved (gotchas.md 2026-10-01).
+			new File(serverDir, "server.properties").setText("online-mode=false\nwhite-list=false\nserver-port=${port}\nmotd=CTCL vanilla guest check\n", "UTF-8")
+			def guest = "CtclGuest"
+
+			// Prepared before the server starts, so the downloads don't count against the join timeout.
+			def root = clientDir.get().asFile
+			def gameDir = new File(root, "game-guest")
+			gameDir.mkdirs()
+			// No accessibility onboarding and no menu blur, which slows software OpenGL. The client is vanilla: no mods.
+			new File(gameDir, "options.txt").setText("onboardAccessibility:false\nmenuBackgroundBlurriness:0\n", "UTF-8")
+			def clientCommand = prepareClient(root, minecraft, gameDir, guest, [], "localhost:${port}")
+
+			def ready = new java.util.concurrent.CountDownLatch(1)
+			def settled = new java.util.concurrent.CountDownLatch(1)
+			def joined = new java.util.concurrent.atomic.AtomicBoolean()
+			def refusal = new java.util.concurrent.atomic.AtomicReference<String>()
+			def serverConsole = new File(serverDir, "guest-console.log")
+			def server = startProcess(serverDir, serverCommand(launchPath, ["--universe", new File(serverDir, "guest").absolutePath, "--world", "world", "nogui"]), serverConsole) { String line, Process process ->
+				if (line =~ /Done \(\d/) {
+					ready.countDown()
+				}
+				if (settled.count > 0 && line.contains("${guest} joined the game")) {
+					joined.set(true)
+					settled.countDown()
+					typeLine(process, "stop")
+				} else if (settled.count > 0 && ((line.contains(guest) && line =~ /(?i)lost connection|disconnect/) || (spec.guestRefusal && line =~ spec.guestRefusal))) {
+					refusal.set(line)
+					settled.countDown()
+					typeLine(process, "stop")
+				}
+			}
+			def clientConsole = new File(gameDir, "guest-console.log")
+			def client = null
+			try {
+				if (!ready.await(10, java.util.concurrent.TimeUnit.MINUTES)) {
+					throw new GradleException("The ${loader} server never logged Done. Console: ${serverConsole}")
+				}
+				client = startProcess(gameDir, clientCommand, clientConsole) { String line, Process process -> }
+				if (!settled.await(10, java.util.concurrent.TimeUnit.MINUTES)) {
+					throw new GradleException("The vanilla client never joined or was refused within 10 minutes. Consoles: ${serverConsole}, ${clientConsole}")
+				}
+			} finally {
+				// Only the processes this task started.
+				if (server[0].alive && !joined.get() && refusal.get() == null) {
+					typeLine(server[0], "stop")
+				}
+				awaitExit(server, 5, "The ${loader} server", serverConsole)
+				if (client != null) {
+					client[0].destroyForcibly()
+					awaitExit(client, 2, "The vanilla client", clientConsole)
+				}
+			}
+			if (!joined.get()) {
+				throw new GradleException("The ${loader} server refused the vanilla client: ${refusal.get()}. Consoles: ${serverConsole}, ${clientConsole}")
+			}
+			logger.lifecycle("A vanilla ${minecraft} client joined the ${loader} ${loaderVersion} server running ${pickProdJars()[0].name}")
+		}
+	}
+
+	// Proves the release jar is byte-for-byte what this version's compile produces. Only this loader's metadata, the
+	// manifest, and the entries of any other loader the release jar's name lists may differ; any other extra entry fails.
+	// Same check as fabric/, for the same reason (compile-time constants, gotchas.md 2026-09-24).
+	tasks.register("checkReleaseJarBytes") {
+		group = "verification"
+		description = "Fails unless the ${loader} release jar in -Pctcl_prod_mods matches this version's jar byte for byte."
+		def builtJar = tasks.named("jar").flatMap { it.archiveFile }
+		inputs.file(builtJar)
+		inputs.files(prodJars)
+		doLast {
+			if (!prodModsDir) {
+				throw new GradleException("checkReleaseJarBytes needs -Pctcl_prod_mods=<dir holding the ${loader} release jar>")
+			}
+			def release = pickProdJars()[0]
+			def others = jarLoaders(release.name) - loader
+			def unknown = others.findAll { !loaderOwned.containsKey(it) }
+			if (unknown) {
+				throw new GradleException("${release.name} lists loader(s) ${unknown} that gradle/release.gradle doesn't know")
+			}
+			def ignored = spec.metadata + ["META-INF/MANIFEST.MF"] + others.collectMany { loaderOwned[it] }
+			def differ = releaseJarDiff(release, builtJar.get().asFile, ignored)
+			if (differ) {
+				throw new GradleException("Release jar ${release.name} is not what Minecraft ${minecraft} compiles to; these entries differ: ${differ}")
+			}
+			logger.lifecycle("Release jar ${release.name} matches the Minecraft ${minecraft} build${others ? " (ignoring ${others.join(', ')}'s entries)" : ''}")
+		}
+	}
+
+	[checkGameTestReport: checkGameTestReport, prodJars: prodJars, pickProdJars: pickProdJars, prodServerDir: prodServerDir,
+	 installServer: installServer, stageMods: stageMods, runServer: runServer, checkRestored: checkRestored]
+}
+
+ext.loaderHarness = loaderHarness

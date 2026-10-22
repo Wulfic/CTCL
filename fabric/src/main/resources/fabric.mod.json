@@ -1,0 +1,33 @@
+{
+	"schemaVersion": 1,
+	"id": "ctcl",
+	"version": "${version}",
+	"name": "Crafting Table Chunk Loader",
+	"description": "Turns every vanilla crafting table into a chunk loader. A button on the crafting screen cycles the loaded square: 0, 1, 3, 5, 7, 9 chunks wide.",
+	"authors": [
+		"wulfic"
+	],
+	"license": "MIT",
+	"environment": "*",
+	"entrypoints": {
+		"main": [
+			"net.wulfnet.ctcl.fabric.CtclFabric"
+		],
+		"client": [
+			"net.wulfnet.ctcl.fabric.client.CtclFabricClient"
+		]
+	},
+	"mixins": [
+		"ctcl.mixins.json",
+		{
+			"config": "ctcl.client.mixins.json",
+			"environment": "client"
+		}
+	],
+	"depends": {
+		"fabricloader": ">=0.19.3",
+		"minecraft": "${minecraft_depends}",
+		"java": ">=25",
+		"fabric-api": "*"
+	}
+}

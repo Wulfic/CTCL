@@ -121,6 +121,8 @@ LOADER_METADATA = {"fabric.mod.json": "Fabric", "META-INF/mods.toml": "Forge", "
 class LoaderRange:
     loader: str
     versions: tuple[str, ...]
+    # (Minecraft version, pinned build) for each version this loader runs on a beta build (owner answer 27).
+    betas: tuple[tuple[str, str], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -179,6 +181,15 @@ def loader_label(loader: str, pins: Sequence[str]) -> str:
     return pins[0] if pins[0] == top else f"{pins[0]}-{top}"
 
 
+def beta_pins(props: dict[str, str], prefix: str, pins: Sequence[str]) -> tuple[tuple[str, str], ...]:
+    """The pins on a beta build, as tools/check_pins.py defines one: a NeoForge build with a suffix (-beta, -alpha...), or a
+    Forge version listed in forge_beta_versions (Forge builds carry no suffix)."""
+    if prefix == "forge":
+        marked = {v.strip() for v in props.get("forge_beta_versions", "").split(",") if v.strip()}
+        return tuple((mc, props[f"forge.{mc}"]) for mc in pins if mc in marked)
+    return tuple((mc, props[f"{prefix}.{mc}"]) for mc in pins if "-" in props[f"{prefix}.{mc}"])
+
+
 def loader_jars(props: dict[str, str], fabric_pins: list[str], fabric_label: str) -> tuple[tuple[ReleaseJar, ...], bool]:
     """Every release jar of a multi-project band, and whether Quilt is supported."""
     quilt_pins = pins_for(props, "quilt_loader")
@@ -198,7 +209,7 @@ def loader_jars(props: dict[str, str], fabric_pins: list[str], fabric_label: str
         outside = [v for v in pins if version_key(v) < version_key(fabric_pins[0]) or release_line(v) not in fabric_lines]
         if outside:
             raise ReleaseError(f"{loader} pins {outside} fall outside the band's range {fabric_label}")
-        ranges.setdefault(loader_label(loader, pins), []).append(LoaderRange(loader, tuple(pins)))
+        ranges.setdefault(loader_label(loader, pins), []).append(LoaderRange(loader, tuple(pins), beta_pins(props, prefix, pins)))
     jars = tuple(ReleaseJar(label, tuple(sorted(group, key=lambda r: LOADER_ORDER.index(r.loader))))
                  for label, group in sorted(ranges.items(), key=lambda item: min(LOADER_ORDER.index(r.loader) for r in item[1])))
     return jars, bool(quilt_pins)
@@ -314,7 +325,7 @@ def cmd_plan(args: argparse.Namespace, runner: Runner) -> int:
     outputs = plan_outputs(plan)
     log(f"band {band.name}: {plan.reason}; version {plan.version}+{band.label}, release={plan.release}")
     for jar in band.jars:
-        log(f"  jar {jar.name(band.archives, plan.version)}: " + "; ".join(f"{r.loader} {', '.join(r.versions)}" for r in jar.loaders))
+        log(f"  jar {jar.name(band.archives, plan.version)}: " + "; ".join(f"{r.loader} {marked_versions(r)}" for r in jar.loaders))
     lines = "".join(f"{k}={v}\n" for k, v in outputs.items())
     sys.stdout.write(lines)
     if os.environ.get("GITHUB_OUTPUT"):
@@ -391,9 +402,19 @@ def check_release_jars(band: Band, version: str, jars_dir: Path) -> list[tuple[R
     return checked
 
 
+def marked_versions(r: LoaderRange) -> str:
+    betas = {mc for mc, _ in r.betas}
+    return ", ".join(f"{v} (beta)" if v in betas else v for v in r.versions)
+
+
 def release_notes(band: Band, version: str, notes_file: str | None, sha: str) -> str:
-    rows = [f"| `{jar.name(band.archives, version)}` | {r.loader} | {', '.join(r.versions)} |" for jar in band.jars for r in jar.loaders]
+    rows = [f"| `{jar.name(band.archives, version)}` | {r.loader} | {marked_versions(r)} |" for jar in band.jars for r in jar.loaders]
     table = "\n".join(["| Jar | Loader | Minecraft |", "|---|---|---|", *rows])
+    betas = ["{} {}".format(r.loader, ", ".join(f"{build} on {mc}" for mc, build in r.betas))
+             for jar in band.jars for r in jar.loaders if r.betas]
+    if betas:
+        table += ("\n\n(beta) means that version was tested on a beta loader build, because it has no stable one yet: "
+                  + "; ".join(betas) + ".")
     body = Path(notes_file).read_text(encoding="utf-8") if notes_file else f"Built from {sha}.\n"
     return f"{table}\n\n{body}"
 

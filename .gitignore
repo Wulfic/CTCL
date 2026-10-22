@@ -182,6 +182,8 @@ local.properties
 history/
 
 # End of universal .gitignore
+# ForgeGradle writes Eclipse run configs for each run on IDE import
+forge/*.launch
 
 ############################
 # Local credentials and MCP configs: never commit (template: .mcp.example.json)

@@ -1,0 +1,27 @@
+modLoader = "javafml"
+# Forge's loader version is its major; the lowest pin's major loads every declared line (forge/build.gradle).
+loaderVersion = "${fml_range}"
+license = "MIT"
+
+[[mods]]
+modId = "ctcl"
+version = "${version}"
+displayName = "Crafting Table Chunk Loader"
+authors = "wulfic"
+description = '''Turns every vanilla crafting table into a chunk loader. A button on the crafting screen cycles the loaded square: 0, 1, 3, 5, 7, 9 chunks wide.'''
+
+# Both ranges come from the forge.<mc> pins (gradle/pins.gradle): each pinned build and newer, up to its next major.
+# Mixin configs are in the jar manifest's MixinConfigs: Forge doesn't read [[mixins]].
+[[dependencies.ctcl]]
+modId = "forge"
+mandatory = true
+versionRange = "${forge_range}"
+ordering = "NONE"
+side = "BOTH"
+
+[[dependencies.ctcl]]
+modId = "minecraft"
+mandatory = true
+versionRange = "${minecraft_range}"
+ordering = "NONE"
+side = "BOTH"

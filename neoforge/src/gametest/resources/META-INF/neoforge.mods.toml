@@ -1,0 +1,16 @@
+modLoader = "javafml"
+loaderVersion = "[4,)"
+license = "MIT"
+
+[[mods]]
+modId = "ctcl_gametest"
+version = "1.0.0"
+displayName = "CTCL game tests"
+description = '''The CTCL server gametests. Test-only: never shipped.'''
+
+[[dependencies.ctcl_gametest]]
+modId = "ctcl"
+type = "required"
+versionRange = "*"
+ordering = "AFTER"
+side = "BOTH"

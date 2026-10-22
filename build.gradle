@@ -1,0 +1,166 @@
+// Multi-project band (TODO Stage 11): common/ holds the loader-neutral code, and each loader
+// project compiles it into its own jar. The loader plugins are loaded once here so every project
+// shares one plugin classloader.
+plugins {
+	id 'net.fabricmc.fabric-loom' version "${loom_version}" apply false
+	id 'net.neoforged.moddev' version "${moddev_version}" apply false
+	id 'net.minecraftforge.gradle' version "${forgegradle_version}" apply false
+}
+
+apply from: rootProject.file('gradle/release.gradle')
+
+// One release jar per Minecraft range (TODO 14.8): ./gradlew releaseJars writes build/release/ctcl-<v>+<label>-<Loaders>.jar,
+// merging the loaders whose release builds share a label. Only a build with no -Pminecraft_version is a release build
+// for every loader, so the task exists only then. Each loader project publishes ext.releaseJar = [label, loaders, jar].
+def releaseDir = layout.buildDirectory.dir("release")
+def loaderProjects = { -> subprojects.findAll { it.name != "common" } }
+
+def checkReleaseJarMerge = tasks.register("checkReleaseJarMerge") {
+	group = "verification"
+	description = "Proves the release-jar merge and byte check refuse bad input, on tiny synthetic jars."
+	doLast {
+		def dir = java.nio.file.Files.createTempDirectory(temporaryDir.toPath(), "run").toFile()
+		def made = []
+		def jar = { String name, Map<String, String> manifest, Map<String, String> entries ->
+			def file = new File(dir, name)
+			def mf = new java.util.jar.Manifest()
+			mf.mainAttributes.put(java.util.jar.Attributes.Name.MANIFEST_VERSION, "1.0")
+			manifest.each { k, v -> mf.mainAttributes.putValue(k, v) }
+			new java.util.jar.JarOutputStream(new FileOutputStream(file), mf).withCloseable { out ->
+				entries.each { path, text ->
+					out.putNextEntry(new java.util.zip.ZipEntry(path))
+					out.write(text.getBytes("UTF-8"))
+					out.closeEntry()
+				}
+			}
+			made << file
+			file
+		}
+		def expectFailure = { String what, String message, File out, Closure action ->
+			try {
+				action()
+			} catch (GradleException e) {
+				if (!e.message.contains(message)) {
+					throw new GradleException("${what}: failed, but with '${e.message}' instead of '${message}'")
+				}
+				if (out.exists()) {
+					throw new GradleException("${what}: failed, yet wrote ${out}")
+				}
+				logger.lifecycle("OK: ${what} is refused (${e.message})")
+				return
+			}
+			throw new GradleException("${what}: the merge accepted it")
+		}
+		def common = ["net/wulfnet/ctcl/Shared.class": "shared"]
+		def forge = jar("ctcl-1.0.0+1.0-Forge.jar", [MixinConfigs: "ctcl.mixins.json"], common + ["META-INF/mods.toml": "forge", "net/wulfnet/ctcl/forge/F.class": "f"])
+		def neo = jar("ctcl-1.0.0+1.0-NeoForge.jar", [:], common + ["META-INF/neoforge.mods.toml": "neo", "net/wulfnet/ctcl/neoforge/N.class": "n"])
+
+		if (jarLoaders("ctcl-1.0.0+26.1.2-26.2-Forge-NeoForge.jar") != ["Forge", "NeoForge"] || jarLoaders("ctcl-1.0.0+26.2-Forge-gametest.jar") != ["Forge", "gametest"]) {
+			throw new GradleException("jarLoaders misreads a jar name")
+		}
+
+		def merged = new File(dir, "ctcl-1.0.0+1.0-Forge-NeoForge.jar")
+		made << merged
+		mergeReleaseJars([forge, neo], merged)
+		def mergedManifest = new java.util.jar.JarFile(merged).withCloseable { it.manifest.mainAttributes.getValue("MixinConfigs") }
+		if (mergedManifest != "ctcl.mixins.json") {
+			throw new GradleException("The merged manifest lost MixinConfigs: ${mergedManifest}")
+		}
+		def forgeIgnores = loaderOwned.Forge.findAll { !it.endsWith("/") } + loaderOwned.NeoForge + ["META-INF/MANIFEST.MF"]
+		if (releaseJarDiff(merged, forge, forgeIgnores) || releaseJarDiff(merged, neo, loaderOwned.NeoForge.findAll { !it.endsWith("/") } + loaderOwned.Forge + ["META-INF/MANIFEST.MF"])) {
+			throw new GradleException("A clean merge doesn't match its loader jars")
+		}
+		logger.lifecycle("OK: a clean merge keeps both loaders' entries and MixinConfigs")
+
+		def single = new File(dir, "ctcl-1.0.0+1.0-Forge-copy.jar")
+		made << single
+		mergeReleaseJars([forge], single)
+		if (!Arrays.equals(single.bytes, forge.bytes)) {
+			throw new GradleException("A one-loader release jar isn't a byte-identical copy")
+		}
+		logger.lifecycle("OK: a one-loader jar is copied byte for byte")
+
+		def neoDrift = jar("ctcl-1.0.0+1.0-NeoForge-drift.jar", [:], ["net/wulfnet/ctcl/Shared.class": "drifted", "META-INF/neoforge.mods.toml": "neo"])
+		def out = new File(dir, "ctcl-1.0.0+1.0-bad.jar")
+		expectFailure("A shared class that differs", "net/wulfnet/ctcl/Shared.class differs", out) { mergeReleaseJars([forge, neoDrift], out) }
+		def neoConflict = jar("ctcl-1.0.0+1.0-NeoForge-conflict.jar", [MixinConfigs: "other.json"], common)
+		expectFailure("A conflicting manifest attribute", "manifest attribute MixinConfigs", out) { mergeReleaseJars([forge, neoConflict], out) }
+
+		def extra = jar("ctcl-1.0.0+1.0-Forge-NeoForge-extra.jar", [:], common + ["META-INF/mods.toml": "forge", "net/wulfnet/ctcl/forge/F.class": "f",
+			"META-INF/neoforge.mods.toml": "neo", "net/wulfnet/ctcl/neoforge/N.class": "n", "net/wulfnet/ctcl/Stray.class": "x"])
+		if (releaseJarDiff(extra, forge, forgeIgnores) != ["net/wulfnet/ctcl/Stray.class"]) {
+			throw new GradleException("The byte check misses an extra entry outside the other loaders' owned paths")
+		}
+		logger.lifecycle("OK: the byte check flags an extra entry outside the other loaders' owned paths")
+
+		// Only the files this run made, by path.
+		made.each { java.nio.file.Files.deleteIfExists(it.toPath()) }
+		java.nio.file.Files.delete(dir.toPath())
+	}
+}
+
+if (gradle.startParameter.projectProperties.minecraft_version == null) {
+	tasks.register("releaseJars") {
+		group = "build"
+		description = "Writes one release jar per Minecraft range to build/release, merging the loaders that share it."
+		dependsOn checkReleaseJarMerge
+		dependsOn { loaderProjects().findAll { it.ext.has("releaseJar") }.collect { it.releaseJar.jar } }
+		inputs.files { loaderProjects().findAll { it.ext.has("releaseJar") }.collect { it.releaseJar.jar } }
+		outputs.dir(releaseDir)
+		// Always runs: Gradle calls the task up to date even with a stranger jar in build/release, and the check below must see it.
+		outputs.upToDateWhen { false }
+		doLast {
+			def missing = loaderProjects().findAll { !it.ext.has("releaseJar") }
+			if (missing) {
+				throw new GradleException("${missing*.path} built no release jar: releaseJars needs every loader on its base")
+			}
+			def jars = loaderProjects().collect { it.releaseJar }
+			def unknown = jars*.loaders.flatten() - loaderOrder
+			if (unknown) {
+				throw new GradleException("Unknown loader(s) ${unknown}: add them to loaderOrder and loaderOwned in gradle/release.gradle")
+			}
+			def plan = jars.groupBy { it.label }.collectEntries { label, group ->
+				def sorted = group.sort { loaderOrder.indexOf(it.loaders.first()) }
+				def loaders = sorted*.loaders.flatten()
+				if (loaders.unique(false).size() != loaders.size()) {
+					throw new GradleException("A loader appears twice in the ${label} group: ${loaders}")
+				}
+				def files = sorted.collect { it.jar.get().archiveFile.get().asFile }
+				files.each { file ->
+					def expected = "${project.archives_base_name}-${project.mod_version}+${label}-"
+					if (!file.name.startsWith(expected)) {
+						throw new GradleException("${file.name} doesn't start with ${expected}: its version isn't this release's")
+					}
+				}
+				[("${project.archives_base_name}-${project.mod_version}+${label}-${loaders.join('-')}.jar".toString()): files]
+			}
+
+			// Never deletes: a jar this run won't write (an older version's, say) fails the task rather than shipping with it.
+			def dir = releaseDir.get().asFile
+			dir.mkdirs()
+			def foreign = (dir.listFiles()?.toList() ?: []).findAll { it.isFile() && !(it.name in plan.keySet()) }
+			if (foreign) {
+				throw new GradleException("${dir} holds files this release wouldn't write: ${foreign*.name}. Move or delete them, then rerun")
+			}
+			plan.each { name, files ->
+				def out = mergeReleaseJars(files, new File(dir, name))
+				logger.lifecycle("${out.name}: ${files.size() == 1 ? 'copied from' : 'merged from'} ${files*.name}")
+			}
+		}
+	}
+}
+
+subprojects {
+	plugins.withType(JavaPlugin).configureEach {
+		java {
+			toolchain {
+				languageVersion = JavaLanguageVersion.of(25)
+			}
+		}
+
+		tasks.withType(JavaCompile).configureEach {
+			it.options.release = 25
+			it.options.compilerArgs += ['-Xlint:all', '-Werror']
+		}
+	}
+}

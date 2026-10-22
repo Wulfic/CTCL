@@ -70,6 +70,10 @@ jobs:
           fetch-tags: true
       - name: Release tooling tests
         run: python3 -m unittest discover -s tools -p "test_*.py"
+      # Owner answer 27: a Forge or NeoForge beta pin only where that version has no stable build. It reads the live
+      # loader APIs and fails closed, so nothing builds or releases on a pin that breaks the rule.
+      - name: Loader pin rule
+        run: python3 tools/check_pins.py
       - id: plan
         name: Plan the version, jars, and matrix
         env:
@@ -180,6 +184,7 @@ jobs:
             build/reports/
             */build/run/**/logs/
             */build/run/**/*.log
+            */build/run/**/*-threads.txt
             */build/reports/
             **/hs_err_pid*.log
           if-no-files-found: ignore
@@ -309,6 +314,7 @@ jobs:
             build/reports/
             */build/run/**/logs/
             */build/run/**/*.log
+            */build/run/**/*-threads.txt
             */build/reports/
             **/hs_err_pid*.log
             ${{ runner.temp }}/*.log
