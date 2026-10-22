@@ -1,0 +1,193 @@
+# Universal .gitignore - common ignores for most languages and tools
+# Customize this file for your project's needs.
+
+############################
+# OS generated files
+############################
+.DS_Store
+Thumbs.db
+desktop.ini
+ehthumbs.db
+
+############################
+# Editor / IDE
+############################
+.vscode/
+.idea/
+*.sublime-workspace
+*.sublime-project
+*.code-workspace
+
+############################
+# Node / JavaScript
+############################
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+.pnpm-store/
+.pnp.*
+.cache/
+dist/
+build/
+out/
+.next/
+.nuxt/
+.parcel-cache/
+
+############################
+# Python
+############################
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+*.pyd
+venv/
+env/
+.venv/
+pip-wheel-metadata/
+*.egg-info/
+.eggs/
+.python-version
+.pytest_cache/
+.mypy_cache/
+.pyre/
+dist/
+build/
+
+############################
+# Java / Gradle / Maven
+############################
+.gradle/
+build/
+target/
+out/
+*.class
+*.jar
+!gradle/wrapper/gradle-wrapper.jar
+*.war
+*.ear
+hs_err_pid*
+
+############################
+# .NET
+############################
+bin/
+obj/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+
+############################
+# C / C++ / CMake
+############################
+*.o
+*.obj
+*.so
+*.a
+*.lib
+*.dll
+*.exe
+*.out
+build/
+cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+
+############################
+# Go
+############################
+bin/
+pkg/
+vendor/
+
+############################
+# Rust
+############################
+target/
+
+############################
+# Logs and databases
+############################
+*.log
+logs/
+*.sql
+*.sqlite
+*.db
+*.db-journal
+
+############################
+# Test / coverage
+############################
+coverage/
+.coverage
+coverage.xml
+lcov.info
+.nyc_output/
+
+############################
+# Secrets / config
+############################
+credentials*
+secrets*
+*.pem
+*.key
+*.crt
+
+############################
+# Docker
+############################
+docker-compose.override.yml
+docker-compose.*.yml
+
+############################
+# Archives / packages
+############################
+*.7z
+*.dmg
+*.gz
+*.rar
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+
+############################
+# Misc / tools
+############################
+.terraform/
+terraform.tfstate
+terraform.tfstate.backup
+.terraform.lock.hcl
+bower_components/
+jspm_packages/
+dist/
+
+############################
+# Minecraft / Fabric (Loom)
+############################
+run/
+# ForgeGradle's generated Eclipse run configs (forge/run*.launch)
+*.launch
+*.iml
+*.ipr
+*.iws
+remappedSrc/
+
+# Local project files
+local.properties
+history/
+
+# End of universal .gitignore
+
+############################
+# Local credentials and MCP configs: never commit (template: .mcp.example.json)
+############################
+.env
+.env.*
+.mcp.json
+.claude/mcp.vscode-reference.json
+.claude/settings.local.json

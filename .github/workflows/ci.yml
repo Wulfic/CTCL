@@ -1,0 +1,363 @@
+# CI for the band branches (Stage 9, decisions.md 2026-09-24; the loader matrix is TODO 15.1).
+#
+# plan    - tools/release.py: band, base version, range label, next version, whether conventional commits since the
+#           band's last tag call for a release, the release jars to ship, and the verify matrix.
+# build   - on the base version: unit tests, server and client gametests, the uninstall check, and (multi-version
+#           bands) the Fabric and Quilt production gametests. Stages the release jars (plus one gametest jar per loader).
+# verify  - (multi-version bands) one job per loader and pin from plan's matrix.
+#           fabric:          the release jar is byte-identical to that pin's compile, the full suite runs recompiled,
+#                            the production gametests run the release jar itself, and Quilt when it has that pin.
+#           neoforge/forge:  the loader's build and byte check, production gametests in a real install, the uninstall
+#                            check, the client smoke test, a vanilla guest joining, and a Fabric -> loader -> Fabric
+#                            world move.
+# release - on a push, when plan says so: tag v<version>+<label>, publish the GitHub release with every jar, then delete
+#           the band's older tags and releases (keep 1, owner's choice).
+#
+# Layout: band/26.1 is a multi-project build (common/ fabric/ neoforge/ forge/). A bare task name runs in every project
+# that has it (gotchas.md "Multi-loader harness traps"), so every task is qualified: FABRIC and COMMON are ":fabric:" and
+# ":common:" there, and empty on band/1.21.11, a single project. tools/test_ci_workflow.py enforces this.
+name: CI
+
+# Push only (the owner's call, 2026-09-29): no pull_request runs and no schedule. workflow_dispatch reruns a band by hand.
+on:
+  push:
+    branches: ['band/**']
+    paths-ignore:
+      - '**.md'
+      - '.agent/**'
+      - '.claude/**'
+      - '.github/skills/**'
+      - '.github/copilot-instructions.md'
+      - 'Logo/**'
+  workflow_dispatch:
+
+# One run per branch at a time, so each release plans against the tags the previous run created.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+# An explicit bash runs with -eo pipefail, so a Gradle failure piped through tee still fails the step.
+defaults:
+  run:
+    shell: bash
+
+env:
+  # setup-java's JDKs, so Gradle's toolchains (21 on 1.21.11, 25 on 26.x) resolve without downloads. The harness
+  # runs tools/mclaunch.py with `python` unless told otherwise, and Ubuntu has only python3.
+  GRADLE_FLAGS: --console=plain --stacktrace -Porg.gradle.java.installations.fromEnv=JAVA_HOME_21_X64,JAVA_HOME_25_X64 -Pctcl_python=python3
+
+jobs:
+  plan:
+    runs-on: ubuntu-24.04
+    outputs:
+      band: ${{ steps.plan.outputs.band }}
+      base: ${{ steps.plan.outputs.base }}
+      multi: ${{ steps.plan.outputs.multi }}
+      quilt: ${{ steps.plan.outputs.quilt }}
+      matrix: ${{ steps.plan.outputs.matrix }}
+      jars: ${{ steps.plan.outputs.jars }}
+      label: ${{ steps.plan.outputs.label }}
+      version: ${{ steps.plan.outputs.version }}
+      release: ${{ steps.plan.outputs.release }}
+      previous_tag: ${{ steps.plan.outputs.previous_tag }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+      - name: Release tooling tests
+        run: python3 -m unittest discover -s tools -p "test_*.py"
+      - id: plan
+        name: Plan the version, jars, and matrix
+        env:
+          BRANCH: ${{ github.ref_name }}
+        run: python3 tools/release.py plan --branch "$BRANCH"
+
+  build:
+    needs: plan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 75
+    env:
+      VERSION: ${{ needs.plan.outputs.version }}
+      JARS: ${{ needs.plan.outputs.jars }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: |
+            21
+            25
+      # Band pushes write the cache (owner answer 18): setup-gradle is read-only off the default branch, and CI never
+      # runs on main, so every run was cold.
+      - uses: gradle/actions/setup-gradle@v6
+        with:
+          cache-read-only: false
+      # Loom wraps client runs in xvfb-run on CI. On 26.3 the OpenGL backend finds no GLX visual there, so the
+      # client falls back to Vulkan, which needs Mesa's lavapipe (as in Fabric API's own CI). A client that can open
+      # no backend hangs rather than exits, hence the step timeouts.
+      - name: xvfb and Mesa Vulkan for the client gametests
+        run: sudo apt-get update && sudo apt-get install -y xvfb mesa-vulkan-drivers
+      - name: Project layout
+        run: |
+          if [ -f fabric/build.gradle ]; then
+            { echo "FABRIC=:fabric:"; echo "COMMON=:common:"; echo "FABRIC_DIR=fabric/"; } >> "$GITHUB_ENV"
+          else
+            { echo "FABRIC="; echo "COMMON="; echo "FABRIC_DIR="; } >> "$GITHUB_ENV"
+          fi
+      - name: Build, unit tests, server gametests
+        run: ./gradlew $GRADLE_FLAGS -Pmod_version="$VERSION" ${COMMON}build ${FABRIC}build
+      - name: Client gametest (xvfb)
+        timeout-minutes: 20
+        run: ./gradlew $GRADLE_FLAGS -Pmod_version="$VERSION" ${FABRIC}runClientGameTest
+      - name: Uninstall check (vanilla server loads the gametest world)
+        run: python3 tools/uninstall_check.py
+      - name: Production gametests with the release jar, then a restart on the saved world
+        if: needs.plan.outputs.multi == 'true'
+        timeout-minutes: 30
+        run: |
+          ./gradlew $GRADLE_FLAGS -Pmod_version="$VERSION" ${FABRIC}prodServerGameTest ${FABRIC}prodClientGameTest
+          ./gradlew $GRADLE_FLAGS -Pmod_version="$VERSION" ${FABRIC}prodServerGameTest
+      - name: Quilt production gametests (server twice for the restart restore, uninstall check, client)
+        # plan fails on partial Quilt coverage, so quilt == 'true' means every Fabric pin has a Quilt pin.
+        if: needs.plan.outputs.multi == 'true' && needs.plan.outputs.quilt == 'true'
+        timeout-minutes: 40
+        env:
+          MC: ${{ needs.plan.outputs.base }}
+        run: |
+          QUILT_FLAGS="-Pmod_version=$VERSION -Pminecraft_version=$MC -Pctcl_loader=quilt"
+          ./gradlew $GRADLE_FLAGS $QUILT_FLAGS ${FABRIC}prodServerGameTest
+          ./gradlew $GRADLE_FLAGS $QUILT_FLAGS ${FABRIC}prodServerGameTest
+          python3 tools/uninstall_check.py --minecraft "$MC" --world "${FABRIC_DIR}build/run/prodServerGameTest/quilt-$MC/world"
+          ./gradlew $GRADLE_FLAGS $QUILT_FLAGS ${FABRIC}prodClientGameTest
+      - name: Build the release jars
+        if: hashFiles('fabric/build.gradle') != ''
+        run: |
+          # releaseJars writes one jar per Minecraft range to build/release, merging the loaders that share it. The
+          # prod tasks, not build, make each loader's gametest jar. A band without one of these projects fails here.
+          ./gradlew $GRADLE_FLAGS -Pmod_version="$VERSION" releaseJars :fabric:gametestJar :neoforge:gametestJar :forge:gametestJar
+      - name: Stage exactly the planned jars
+        run: |
+          # writelines, not print: an empty list must give no lines, not one empty one.
+          mapfile -t want < <(python3 -c 'import json, os, sys; sys.stdout.writelines(j + "\n" for j in json.loads(os.environ["JARS"]))')
+          if [ "${#want[@]}" -eq 0 ]; then echo "plan listed no release jars"; exit 1; fi
+          mkdir -p release-jars
+          if [ -f fabric/build.gradle ]; then
+            src=build/release
+            # releaseJars never deletes, but a fresh checkout has nothing else there: anything unplanned fails the run.
+            got=$(ls "$src" | sort)
+            expected=$(printf '%s\n' "${want[@]}" | sort)
+            if [ "$got" != "$expected" ]; then echo "$src holds:"; echo "$got"; echo "plan ships:"; echo "$expected"; exit 1; fi
+          else
+            src=build/libs
+          fi
+          for jar in "${want[@]}"; do cp "$src/$jar" release-jars/; done
+          if [ "${{ needs.plan.outputs.multi }}" = true ]; then
+            # One gametest jar per loader project, built on the base; the prod runs pick theirs by the loader in the name.
+            for p in fabric neoforge forge; do
+              if [ -f "$p/build.gradle" ]; then libs=$p/build/libs; elif [ "$p" = fabric ]; then libs=build/libs; else continue; fi
+              mapfile -t gametest < <(ls "$libs"/*-"$VERSION"+*-gametest.jar 2>/dev/null)
+              if [ "${#gametest[@]}" -ne 1 ]; then echo "Expected one gametest jar in $libs, found: ${gametest[*]}"; exit 1; fi
+              cp "${gametest[0]}" release-jars/
+            done
+          fi
+          ls -l release-jars
+      - uses: actions/upload-artifact@v7
+        with:
+          name: release-jars
+          path: release-jars/
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v7
+        if: failure()
+        with:
+          name: logs-build-${{ needs.plan.outputs.base }}
+          path: |
+            build/run/*/logs/
+            build/run/*/*/logs/
+            build/reports/
+            */build/run/**/logs/
+            */build/run/**/*.log
+            */build/reports/
+            **/hs_err_pid*.log
+          if-no-files-found: ignore
+
+  verify:
+    needs: [plan, build]
+    if: needs.plan.outputs.multi == 'true'
+    name: verify (${{ matrix.loader }} ${{ matrix.minecraft }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        # {loader, minecraft, quilt}: Fabric on each non-base pin, NeoForge and Forge on each of theirs (owner answer 17).
+        include: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    env:
+      VERSION: ${{ needs.plan.outputs.version }}
+      MC: ${{ matrix.minecraft }}
+      LOADER: ${{ matrix.loader }}
+      # Absolute: each project resolves -Pctcl_prod_mods with its own fileTree(), so release-jars would mean
+      # fabric/release-jars in :fabric (gotchas.md). -Pctcl_world goes through rootProject.file(), so it may be relative.
+      PROD_MODS: ${{ github.workspace }}/release-jars
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: |
+            21
+            25
+      - uses: gradle/actions/setup-gradle@v6
+        with:
+          cache-read-only: false
+      # Mesa Vulkan and step timeouts: see the build job.
+      - name: xvfb and Mesa Vulkan for the clients
+        run: sudo apt-get update && sudo apt-get install -y xvfb mesa-vulkan-drivers
+      - name: Project layout
+        run: |
+          if [ -f fabric/build.gradle ]; then
+            { echo "FABRIC=:fabric:"; echo "COMMON=:common:"; echo "FABRIC_DIR=fabric/"; } >> "$GITHUB_ENV"
+          else
+            { echo "FABRIC="; echo "COMMON="; echo "FABRIC_DIR="; } >> "$GITHUB_ENV"
+          fi
+      - uses: actions/download-artifact@v8
+        with:
+          name: release-jars
+          path: release-jars
+
+      # --- fabric -------------------------------------------------------------------------------------------------
+      - name: Release jar is byte-identical to this version's compile
+        if: matrix.loader == 'fabric'
+        run: ./gradlew $GRADLE_FLAGS -Pmod_version="$VERSION" -Pminecraft_version="$MC" -Pctcl_prod_mods="$PROD_MODS" ${FABRIC}checkReleaseJarBytes
+      - name: Full suite, recompiled for this version
+        if: matrix.loader == 'fabric'
+        timeout-minutes: 30
+        run: ./gradlew $GRADLE_FLAGS -Pmod_version="$VERSION" -Pminecraft_version="$MC" ${COMMON}build ${FABRIC}build ${FABRIC}runClientGameTest
+      - name: Uninstall check
+        if: matrix.loader == 'fabric'
+        run: python3 tools/uninstall_check.py --minecraft "$MC"
+      - name: Production gametests running the release jar on this version
+        if: matrix.loader == 'fabric'
+        timeout-minutes: 30
+        run: ./gradlew $GRADLE_FLAGS -Pmod_version="$VERSION" -Pminecraft_version="$MC" -Pctcl_prod_mods="$PROD_MODS" ${FABRIC}prodServerGameTest ${FABRIC}prodClientGameTest
+      - name: Quilt production gametests (server twice for the restart restore, uninstall check, client)
+        if: matrix.loader == 'fabric' && matrix.quilt
+        timeout-minutes: 40
+        run: |
+          QUILT_FLAGS="-Pmod_version=$VERSION -Pminecraft_version=$MC -Pctcl_loader=quilt -Pctcl_prod_mods=$PROD_MODS"
+          ./gradlew $GRADLE_FLAGS $QUILT_FLAGS ${FABRIC}prodServerGameTest
+          ./gradlew $GRADLE_FLAGS $QUILT_FLAGS ${FABRIC}prodServerGameTest
+          python3 tools/uninstall_check.py --minecraft "$MC" --world "${FABRIC_DIR}build/run/prodServerGameTest/quilt-$MC/world"
+          ./gradlew $GRADLE_FLAGS $QUILT_FLAGS ${FABRIC}prodClientGameTest
+
+      # --- neoforge / forge (the 14.9 sweep's steps) --------------------------------------------------------------
+      # The harness starts these clients itself (tools/mclaunch.py), not through Loom, so nothing wraps them in
+      # xvfb-run. One display for the whole job, set before the first Gradle call so the daemon starts with DISPLAY.
+      - name: Virtual display for the loader clients
+        if: matrix.loader != 'fabric'
+        run: |
+          Xvfb :99 -screen 0 1280x1024x24 -nolisten tcp > "$RUNNER_TEMP/xvfb.log" 2>&1 &
+          echo "DISPLAY=:99" >> "$GITHUB_ENV"
+      - name: Loader build (dev gametests)
+        if: matrix.loader != 'fabric'
+        timeout-minutes: 40
+        run: ./gradlew $GRADLE_FLAGS -Pmod_version="$VERSION" -Pminecraft_version="$MC" ":$LOADER:build"
+      - name: Byte check and production gametests in a real install
+        if: matrix.loader != 'fabric'
+        timeout-minutes: 30
+        run: |
+          ./gradlew $GRADLE_FLAGS -Pmod_version="$VERSION" -Pminecraft_version="$MC" -Pctcl_prod_mods="$PROD_MODS" \
+            ":$LOADER:checkReleaseJarBytes" ":$LOADER:prodServerGameTest" | tee "$RUNNER_TEMP/prod-server.log"
+      - name: Uninstall check on the saved world
+        if: matrix.loader != 'fabric'
+        run: |
+          if [ "$LOADER" = neoforge ]; then
+            world="neoforge/build/run/prodServerGameTest/$MC-release/gametestserver/gametestworld"
+          else
+            # Forge makes a new world each run and logs where it is.
+            world=$(grep -a "Forge saved the gametest world at " "$RUNNER_TEMP/prod-server.log" | tail -1 | sed 's/.* at //' | tr -d '\r')
+          fi
+          if [ -z "$world" ] || [ ! -d "$world" ]; then echo "No saved gametest world found (got '$world')"; exit 1; fi
+          python3 tools/uninstall_check.py --minecraft "$MC" --world "$world"
+      - name: Client smoke test and a vanilla guest joining
+        if: matrix.loader != 'fabric'
+        timeout-minutes: 30
+        run: ./gradlew $GRADLE_FLAGS -Pmod_version="$VERSION" -Pminecraft_version="$MC" -Pctcl_prod_mods="$PROD_MODS" ":$LOADER:prodClientSmoke" ":$LOADER:prodVanillaGuest"
+      - name: World move, Fabric -> loader -> Fabric
+        if: matrix.loader != 'fabric'
+        timeout-minutes: 30
+        run: |
+          case "$LOADER" in neoforge) name=NeoForge ;; forge) name=Forge ;; *) echo "Unknown loader $LOADER"; exit 1 ;; esac
+          ./gradlew $GRADLE_FLAGS -Pmod_version="$VERSION" -Pminecraft_version="$MC" ${FABRIC}prodServerGameTest
+          fabric_world="${FABRIC_DIR}build/run/prodServerGameTest/$MC/world"
+          ./gradlew $GRADLE_FLAGS -Pmod_version="$VERSION" -Pminecraft_version="$MC" -Pctcl_prod_mods="$PROD_MODS" \
+            "-Pctcl_world=$fabric_world" ":$LOADER:prodServerRestore" | tee "$RUNNER_TEMP/restore.log"
+          moved=$(grep -a "$name saved the imported world at " "$RUNNER_TEMP/restore.log" | tail -1 | sed 's/.* at //' | tr -d '\r')
+          if [ -z "$moved" ] || [ ! -d "$moved" ]; then echo "$name logged no imported world (got '$moved')"; exit 1; fi
+          ./gradlew $GRADLE_FLAGS -Pmod_version="$VERSION" -Pminecraft_version="$MC" "-Pctcl_world=$moved" ${FABRIC}prodServerGameTest
+
+      - uses: actions/upload-artifact@v7
+        if: failure()
+        with:
+          name: logs-${{ matrix.loader }}-${{ matrix.minecraft }}
+          path: |
+            build/run/*/logs/
+            build/run/*/*/logs/
+            build/reports/
+            */build/run/**/logs/
+            */build/run/**/*.log
+            */build/reports/
+            **/hs_err_pid*.log
+            ${{ runner.temp }}/*.log
+          if-no-files-found: ignore
+
+  release:
+    needs: [plan, build, verify]
+    # verify is skipped on single-version bands; anything else must have succeeded.
+    if: >-
+      !cancelled()
+      && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+      && needs.plan.outputs.release == 'true'
+      && needs.build.result == 'success'
+      && (needs.verify.result == 'success' || needs.verify.result == 'skipped')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      VERSION: ${{ needs.plan.outputs.version }}
+      LABEL: ${{ needs.plan.outputs.label }}
+      BAND: ${{ needs.plan.outputs.band }}
+      BRANCH: ${{ github.ref_name }}
+      PREVIOUS_TAG: ${{ needs.plan.outputs.previous_tag }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+      - uses: actions/download-artifact@v8
+        with:
+          name: release-jars
+          path: release-jars
+      - name: Release notes
+        run: |
+          {
+            echo "CTCL $VERSION for Minecraft $LABEL. Built from ${GITHUB_SHA}."
+            echo
+            if [ -n "$PREVIOUS_TAG" ]; then
+              echo "Changes since $PREVIOUS_TAG:"
+              git log --no-merges --format='- %s' "$PREVIOUS_TAG..$GITHUB_SHA"
+            else
+              echo "First release of this band."
+            fi
+          } > release-notes.md
+          cat release-notes.md
+      - name: Tag and publish every planned jar
+        # Refuses unless release-jars holds exactly the plan's jars, each declaring <version>+<its range> in the metadata
+        # of exactly the loaders its name lists. The gametest jars are skipped.
+        run: python3 tools/release.py publish --branch "$BRANCH" --version "$VERSION" --jars-dir release-jars --sha "$GITHUB_SHA" --notes-file release-notes.md
+      - name: Delete the band's older tags and releases (keep the newest)
+        run: python3 tools/release.py cleanup --band "$BAND" --keep "v$VERSION+$LABEL" --force
