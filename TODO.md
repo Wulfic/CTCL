@@ -1199,7 +1199,7 @@ release ships **one** jar: `ctcl-<v>+26.1-26.3-Fabric-Quilt-Forge-NeoForge.jar`.
 
 ---
 
-## Stage 17 — Public release in a fresh repo (Tier 2, owner answers 2026-10-22)
+## Stage 17 — Public release in a fresh repo (Tier 2, owner answers 2026-10-22) ✅ 2026-10-22
 
 Owner answers: the new repo takes `Wulfic/CTCL`; the old one becomes `Wulfic/CTCL-private-archive`, archived. Dev notes
 are kept, redacted. Both releases are recreated. License: MIT. Decision: `decisions.md` 2026-10-22.
@@ -1214,16 +1214,17 @@ are kept, redacted. Both releases are recreated. License: MIT. Decision: `decisi
 - [x] 17.3 Verify: a scan with the literal old secret values plus token/IP/path regexes over every committed blob: 0
   hits (the same scan finds 42 in the old `band/26.1`). Only the intended files differ from the old tips; every other
   blob is byte-identical. Python tool tests and `gradlew build` green.
-- [ ] 17.4 Back up both releases → `~/.ctcl-backups/public-migration/` (sha256 matches GitHub's digests).
-- [ ] 17.5 `gh repo rename CTCL-private-archive -R Wulfic/CTCL`, then repoint the old folder's `origin` at once.
+- [x] 17.4 Back up both releases → `~/.ctcl-backups/public-migration/` (sha256 matches GitHub's digests).
+- [x] 17.5 `gh repo rename CTCL-private-archive -R Wulfic/CTCL`, then repoint the old folder's `origin` at once.
   **Undo:** `gh repo rename CTCL -R Wulfic/CTCL-private-archive` (before 17.6 only).
-- [ ] 17.6 `gh repo create Wulfic/CTCL --private`; Actions off; push `main`, the two tags, both bands. **Undo:** delete
+- [x] 17.6 `gh repo create Wulfic/CTCL --private`; Actions off; push `main`, the two tags, both bands. **Undo:** delete
   the new repo (nothing public yet).
-- [ ] 17.7 Recreate both releases from the backup; verify the asset sha256s. Actions back on.
-- [ ] 17.8 `gh repo archive Wulfic/CTCL-private-archive --yes`. **Undo:** `gh repo unarchive Wulfic/CTCL-private-archive`.
-- [ ] 17.9 Owner go → `gh repo edit Wulfic/CTCL --visibility public`. **No real undo**: treat anything public as permanent.
-- [ ] 17.10 The local clone is `Repos/CTCL-public`, with the untracked `.env` / MCP configs copied in. The owner swaps the
-  folder names (old → `CTCL-private-archive`, new → `CTCL`) with VS Code closed.
+- [x] 17.7 Recreate both releases from the backup; verify the asset sha256s. Actions back on.
+- [x] 17.8 `gh repo archive Wulfic/CTCL-private-archive --yes`. **Undo:** `gh repo unarchive Wulfic/CTCL-private-archive`.
+- [x] 17.9 Owner go → `gh repo edit Wulfic/CTCL --visibility public`. **No real undo**: treat anything public as permanent.
+- [x] 17.10 The local clone is `Repos/CTCL-public`, with the untracked `.env` / MCP configs copied in. The owner swaps the
+  folder names (old → `CTCL-private-archive`, new → `CTCL`) with VS Code closed. **Owner:** that swap, and copy `.env`
+  in by hand (an agent can't: `.env` is deny-listed). The MCP configs are already copied.
 
 ## Owner follow-ups (post-release)
 - [ ] `TESTING.md` LAN checklist on 1.21.11 (old 6.1) with a second client and a vanilla guest.

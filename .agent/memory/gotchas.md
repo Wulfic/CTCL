@@ -882,3 +882,16 @@ closed`). `startProcess` logs that when the process is dead, and rethrows it oth
 different pin. If the one retry also times out, the next step is `earlyWindowControl = false` on CI. That needs the owner:
 answer 43 kept the early window on.
 **Affects:** `gradle/harness.gradle`
+
+## 2026-10-22 — Exporting a tree on this machine: CRLF, MAX_PATH, and silent partial trees
+**Symptom:** Staging the public repo from `git archive`, nearly every blob differed from the original, `git add`
+failed on one gametest JSON, and a Python scan saw 139 of 144 files.
+**Cause:** (1) The system gitconfig sets `core.autocrlf=true`, so `git archive` wrote CRLF and a repo with
+`autocrlf=false` committed it verbatim. (2) The scratchpad path plus the longest gametest filename passes 260 chars:
+`git add` needs `core.longpaths=true`, and Python's `rglob`/`is_file()` silently skips such files. (3) A helper that
+chained with `;` kept going after `git add` failed and wrote a partial tree.
+**Fix:** `git -c core.autocrlf=false archive`; `core.longpaths=true`; `set -euo pipefail` and an indexed-vs-on-disk
+file count; scan blobs with `git ls-tree`/`git show`, not the filesystem. Prove a rebuild by comparing blob hashes
+with the original (only intended files may differ).
+**Dead ends:** `grep -c $''` in Git Bash reports 0 on CRLF files; use `od -c`.
+**Affects:** any export, staging, or scan of this repo's trees
