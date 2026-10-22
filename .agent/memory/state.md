@@ -18,9 +18,8 @@
   `workflow_dispatch`. **A green band run releases.** Diagnose on a throwaway `ci/*` branch with its own workflow.
 
 ## What's next
-1. **The owner:** rotate every credential that was in the old repo (GitHub PAT, Context7 key, every `.env` password).
-   Copy `.env` into this folder by hand (an agent can't: `.env` is deny-listed). Swap the folder names with VS Code
-   closed: `CTCL` → `CTCL-private-archive`, `CTCL-public` → `CTCL`.
+1. **The owner** will delete `Wulfic/CTCL-private-archive` by hand. The local old history is backed up in
+   `~/.ctcl-backups/` (`ctcl-private-history.bundle`, `ctcl-private.git`).
 2. **Watch:** Forge's early-window timeout (one retry, answer 43) and the Forge 26.1.2 restart hang (1 in 8 runs). On
    either, read `<console>-threads.txt` in the failure artifact.
 3. **Pin notice:** NeoForge `26.3.0.40-beta` shipped (pin: `.39-beta`). Bumping a beta pin needs a fresh sweep (answer 31).

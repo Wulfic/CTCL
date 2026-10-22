@@ -1222,9 +1222,8 @@ are kept, redacted. Both releases are recreated. License: MIT. Decision: `decisi
 - [x] 17.7 Recreate both releases from the backup; verify the asset sha256s. Actions back on.
 - [x] 17.8 `gh repo archive Wulfic/CTCL-private-archive --yes`. **Undo:** `gh repo unarchive Wulfic/CTCL-private-archive`.
 - [x] 17.9 Owner go → `gh repo edit Wulfic/CTCL --visibility public`. **No real undo**: treat anything public as permanent.
-- [x] 17.10 The local clone is `Repos/CTCL-public`, with the untracked `.env` / MCP configs copied in. The owner swaps the
-  folder names (old → `CTCL-private-archive`, new → `CTCL`) with VS Code closed. **Owner:** that swap, and copy `.env`
-  in by hand (an agent can't: `.env` is deny-listed). The MCP configs are already copied.
+- [x] 17.10 The local `CTCL` folder stays put: its `.git` was swapped for the clean one, so it mirrors `Wulfic/CTCL`
+  exactly, with the untracked `.env` / MCP configs still in place. Old `.git` → `~/.ctcl-backups/ctcl-private.git`.
 
 ## Owner follow-ups (post-release)
 - [ ] `TESTING.md` LAN checklist on 1.21.11 (old 6.1) with a second client and a vanilla guest.
